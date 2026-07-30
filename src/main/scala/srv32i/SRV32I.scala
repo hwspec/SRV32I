@@ -1,13 +1,181 @@
 package srv32i
 
-import axi._
-import axi.AxiModuleParamsHelper._
-import upickle.default._
-
 import chisel3._
 import chisel3.util._
 
-class SimpleRV32I extends Module {
+object ALU {
+  val ADD  = 0.U(4.W)
+  val SUB  = 1.U(4.W)
+  val SLL  = 2.U(4.W)
+  val SLT  = 3.U(4.W)
+  val SLTU = 4.U(4.W)
+  val XOR  = 5.U(4.W)
+  val SRL  = 6.U(4.W)
+  val SRA  = 7.U(4.W)
+  val OR   = 8.U(4.W)
+  val AND  = 9.U(4.W)
+
+  def compute(op: UInt, a: UInt, b: UInt): UInt = {
+    val shamt = b(4, 0)
+    MuxLookup(op, 0.U)(Seq(
+      ADD  -> (a + b),
+      SUB  -> (a - b),
+      SLL  -> (a << shamt)(31, 0),
+      SLT  -> (a.asSInt < b.asSInt).asUInt,
+      SLTU -> (a < b),
+      XOR  -> (a ^ b),
+      SRL  -> (a >> shamt),
+      SRA  -> (a.asSInt >> shamt).asUInt,
+      OR   -> (a | b),
+      AND  -> (a & b)
+    ))
+  }
+}
+
+class BranchUnit extends Module {
+  val io = IO(new Bundle {
+    val funct3   = Input(UInt(3.W))
+    val rs1Data  = Input(UInt(32.W))
+    val rs2Data  = Input(UInt(32.W))
+    val isBranch = Input(Bool())
+    val taken    = Output(Bool())
+  })
+
+  val taken = WireDefault(false.B)
+  when(io.isBranch) {
+    switch(io.funct3) {
+      is("b000".U) { taken := io.rs1Data === io.rs2Data }               // BEQ
+      is("b001".U) { taken := io.rs1Data =/= io.rs2Data }               // BNE
+      is("b100".U) { taken := io.rs1Data.asSInt < io.rs2Data.asSInt }   // BLT
+      is("b101".U) { taken := io.rs1Data.asSInt >= io.rs2Data.asSInt }  // BGE
+      is("b110".U) { taken := io.rs1Data < io.rs2Data }                 // BLTU
+      is("b111".U) { taken := io.rs1Data >= io.rs2Data }                // BGEU
+    }
+  }
+  io.taken := taken
+}
+
+class DecodedInst extends Bundle {
+  val rd     = UInt(5.W)
+  val rs1    = UInt(5.W)
+  val rs2    = UInt(5.W)
+  val funct3 = UInt(3.W)
+  val funct7 = UInt(7.W)
+
+  val immI = UInt(32.W)
+  val immS = UInt(32.W)
+  val immB = UInt(32.W)
+  val immU = UInt(32.W)
+  val immJ = UInt(32.W)
+
+  val isRType  = Bool()
+  val isIType  = Bool()
+  val isLoad   = Bool()
+  val isStore  = Bool()
+  val isBranch = Bool()
+  val isLUI    = Bool()
+  val isAUIPC  = Bool()
+  val isJAL    = Bool()
+  val isJALR   = Bool()
+  val isECALL  = Bool()
+  val illegal  = Bool()
+}
+
+// Pure combinational decode of a 32-bit instruction word.
+class Decoder extends Module {
+  val io = IO(new Bundle {
+    val inst = Input(UInt(32.W))
+    val out  = Output(new DecodedInst)
+  })
+
+  val inst   = io.inst
+  val opcode = inst(6, 0)
+
+  io.out.rd     := inst(11, 7)
+  io.out.rs1    := inst(19, 15)
+  io.out.rs2    := inst(24, 20)
+  io.out.funct3 := inst(14, 12)
+  io.out.funct7 := inst(31, 25)
+
+  io.out.immI := Cat(Fill(20, inst(31)), inst(31, 20))
+  io.out.immS := Cat(Fill(20, inst(31)), inst(31, 25), inst(11, 7))
+  io.out.immB := Cat(Fill(19, inst(31)), inst(31), inst(7), inst(30, 25), inst(11, 8), 0.U(1.W))
+  io.out.immU := Cat(inst(31, 12), 0.U(12.W))
+  io.out.immJ := Cat(Fill(11, inst(31)), inst(31), inst(19, 12), inst(20), inst(30, 21), 0.U(1.W))
+
+  val isRType  = opcode === "b0110011".U
+  val isIType  = opcode === "b0010011".U
+  val isLoad   = opcode === "b0000011".U
+  val isStore  = opcode === "b0100011".U
+  val isBranch = opcode === "b1100011".U
+  val isLUI    = opcode === "b0110111".U
+  val isAUIPC  = opcode === "b0010111".U
+  val isJAL    = opcode === "b1101111".U
+  val isJALR   = opcode === "b1100111".U
+  val isECALL  = opcode === "b1110011".U && io.out.funct3 === 0.U && io.out.immI === 0.U
+
+  io.out.isRType  := isRType
+  io.out.isIType  := isIType
+  io.out.isLoad   := isLoad
+  io.out.isStore  := isStore
+  io.out.isBranch := isBranch
+  io.out.isLUI    := isLUI
+  io.out.isAUIPC  := isAUIPC
+  io.out.isJAL    := isJAL
+  io.out.isJALR   := isJALR
+  io.out.isECALL  := isECALL
+
+  val legal = isRType || isIType || isLoad || isStore || isBranch ||
+    isLUI || isAUIPC || isJAL || isJALR || isECALL
+  io.out.illegal := !legal
+}
+
+object MemAccess {
+  def storeMask(funct3: UInt): UInt = MuxLookup(funct3, "b1111".U)(Seq(
+    "b000".U -> "b0001".U, // SB
+    "b001".U -> "b0011".U, // SH
+    "b010".U -> "b1111".U  // SW
+  ))
+
+  def loadData(funct3: UInt, rdata: UInt): UInt = MuxLookup(funct3, rdata)(Seq(
+    "b000".U -> Cat(Fill(24, rdata(7)), rdata(7, 0)),    // LB
+    "b001".U -> Cat(Fill(16, rdata(15)), rdata(15, 0)),  // LH
+    "b010".U -> rdata,                                    // LW
+    "b100".U -> Cat(0.U(24.W), rdata(7, 0)),              // LBU
+    "b101".U -> Cat(0.U(16.W), rdata(15, 0))              // LHU
+  ))
+}
+
+
+class RegFile extends Module {
+  val io = IO(new Bundle {
+    val rs1Addr = Input(UInt(5.W))
+    val rs2Addr = Input(UInt(5.W))
+    val rs1Data = Output(UInt(32.W))
+    val rs2Data = Output(UInt(32.W))
+
+    val wen   = Input(Bool())
+    val waddr = Input(UInt(5.W))
+    val wdata = Input(UInt(32.W))
+
+    val debugRegs = Output(Vec(32, UInt(32.W)))
+  })
+
+  val regs = Mem(32, UInt(32.W))
+
+  io.rs1Data := Mux(io.rs1Addr === 0.U, 0.U, regs.read(io.rs1Addr))
+  io.rs2Data := Mux(io.rs2Addr === 0.U, 0.U, regs.read(io.rs2Addr))
+
+  when(io.wen && io.waddr =/= 0.U) {
+    regs.write(io.waddr, io.wdata)
+  }
+
+  for (i <- 0 until 32) {
+    io.debugRegs(i) := (if (i == 0) 0.U else regs.read(i.U))
+  }
+}
+
+class SRV32I extends Module {
   val io = IO(new Bundle {
     val enable       = Input(Bool())
     val softReset    = Input(Bool())
@@ -185,30 +353,4 @@ class SimpleRV32I extends Module {
   io.debugStatus.halted      := haltedReg
   io.debugStatus.illegalInst := illegalReg
   io.debugStatus.ecall       := ecallReg
-}
-
-
-case class SimpleRV32IModuleParams( // Note: do not put default value here
-                               // DefParams
-                               soft_reset_rw: Long,
-                             ) extends AxiModuleParams with AxiModuleDefParams
-{
-  val moduleName = "SimpleRV32I"
-}
-
-object SimpleRV32IModuleParams {
-  implicit val rw: ReadWriter[SimpleRV32IModuleParams] = macroRW
-
-  def default() : SimpleRV32IModuleParams =
-    new SimpleRV32IModuleParams(soft_reset_rw = 0x0)
-}
-
-
-object SimpleRV32I extends App {
-    import axi.EmitVerilog
-
-  val p = checkParamEnv(
-    SimpleRV32IModuleParams.default(),
-    "SIMPLERV32I_MODULE_PARAMS")
-  EmitVerilog.generate(new SimpleRV32I, p)
 }

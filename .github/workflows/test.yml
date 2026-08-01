@@ -1,34 +1,37 @@
 name: Continuous Integration
 
-on:
-  push:
-    tags: ['*']
-    branches: ['main']
-  pull_request:
-  workflow_dispatch:
+on: [push]
 
 jobs:
   ci:
-    if: ${{ false }}
+#    if: ${{ false }}
     name: ci
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Cleanup
-        run: sed -i "s/%NAME%/test/g" build.mill
+      - name: Update
+        run: sudo apt-get update
       - name: Cache Scala
         uses: coursier/cache-action@v6
       - name: Setup Scala
         uses: coursier/setup-action@v1
         with:
-          jvm: adopt:11
-          apps: sbt
+          jvm: temurin:17
+          apps: sbt mill
       - name: Setup Dependencies
+        run: sudo apt-get install -y ccache
+      - name: Initialize submodule
+        run: git submodule update --init --recursive
+      - name: Install Verilator
+        run: sudo apt-get install -y verilator gcc
+      - name: Show versions
         run: |
-          sudo apt-get install verilator
-          verilator --version
-      - name: SBT Test
-        run: sbt test
-      - name: mill Test
-        run: ./mill _.test
+          java -version
+          sbt --version
+      - name: Setup chisel-axi-utils and run tests
+        shell: bash
+        run: |
+          make -C chisel-axi-utils setup
+          source chisel-axi-utils/.venv/bin/activate
+          sbt test

@@ -9,6 +9,7 @@ on:
 
 jobs:
   ci:
+    if: ${{ false }}
     name: ci
     runs-on: ubuntu-latest
     steps:

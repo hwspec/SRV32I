@@ -23,8 +23,16 @@ jobs:
         run: sudo apt-get install -y ccache
       - name: Initialize submodule
         run: git submodule update --init --recursive
-      - name: Install Verilator
-        run: sudo apt-get install -y verilator gcc
+      - name: Install Verilator 5.044
+        run: |
+          sudo apt-get install -y git help2man perl python3 make g++ libfl2 libfl-dev zlib1g zlib1g-dev
+          git clone https://github.com/verilator/verilator
+          cd verilator
+          git checkout v5.044
+          autoconf
+         ./configure
+         make -j$(nproc)
+         sudo make install
       - name: Show versions
         run: |
           java -version

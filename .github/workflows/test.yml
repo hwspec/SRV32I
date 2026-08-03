@@ -30,9 +30,9 @@ jobs:
           cd verilator
           git checkout v5.044
           autoconf
-         ./configure
-         make -j$(nproc)
-         sudo make install
+          ./configure
+          make -j$(nproc)
+          sudo make install
       - name: Show versions
         run: |
           java -version

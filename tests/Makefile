@@ -6,7 +6,7 @@ SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
 TOPNAME=user_accel_bd_wrapper
 HWMODULENAME=AXI_SRV32I
-SRCDIR = $(abspath ../../generated/$(HWMODULENAME))
+SRCDIR = $(abspath ../generated/$(HWMODULENAME))
 VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
 
 WAVES = 1

@@ -137,6 +137,16 @@ Conventions you MUST follow, based on the worked example:
   no handshake) are given host-accessible read/write windows in the register
   map, typically gated to be writable/readable only while the DUT is
   disabled, if the DUT has an enable/start control.
+- Byte-maskable memories MUST be declared `SyncReadMem(depth, Vec(4, UInt(8.W)))`,
+  never `SyncReadMem(depth, UInt(32.W))`. `SyncReadMem.write(addr, data, mask)`
+  requires `data: Vec[T]` so each mask bit lines up with one element — a flat
+  `UInt` will not compile with a mask argument. Slice the write data into
+  bytes before writing, and reassemble with `.asUInt` after reading:
+    val wdataVec = VecInit((0 until 4).map(i => wdata(8 * i + 7, 8 * i)))
+    when(wen) { mem.write(idx, wdataVec, wmask.asBools) }
+    val rdata = mem.read(idx, ren).asUInt
+  This applies to every masked-write memory in the bridge, including any
+  DUT-side data memory exposed through a host read/write window.
 - Debug/status outputs on the DUT are exposed as read-only registers.
 - Control inputs on the DUT (enable, reset, entry point, etc.) are exposed
   as read/write registers, mapped 1:1.

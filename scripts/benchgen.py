@@ -230,6 +230,13 @@ Conventions you MUST follow, based on the worked example:
   read back registers to confirm state cleared.
 - Use `dut.log.info(...)` for progress/debug lines, plain `assert` statements
   for checks (with an f-string message where it adds diagnostic value).
+- If the test program needs a halt-causing instruction, use `ecall`
+  (`0x00000073`, RV32I `SYSTEM` opcode with `imm[11:0] == 0`), NOT `ebreak`
+  (`0x00100073`, `imm[11:0] == 1`). Unless the DUT's decoder explicitly
+  documents `ebreak` support, assume only `ecall` is a legal halt cause —
+  using `ebreak` will trap as an illegal instruction instead and the test
+  will falsely fail with the illegal-instruction status bit set instead of
+  the ecall bit.
 
 Also generate the matching Makefile, following this exact structure (only
 substitute the module/package names):

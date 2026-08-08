@@ -339,3 +339,14 @@ project/plugins/project/
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 
+
+
+generated/
+scripts/AxiSRV32I.scala
+scripts/Makefile
+scripts/tb_axisrv32i.py
+tests/__pycache__/
+tests/dump.vcd
+tests/results.xml
+tests/sim_build/
+

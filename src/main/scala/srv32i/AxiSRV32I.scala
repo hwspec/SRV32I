@@ -1,29 +1,34 @@
 // =============================================================================
-// AXI4-Lite bridge for SRV32I
+// AXI4-Lite Bridge for SRV32I
 // Package: srv32i
 //
-// Register Map (all offsets within 1MB MMIO window, spaced 0x10 apart):
+// Register Map (all offsets relative to MMIO base, 1MB window via addr[19:0]):
 //
-//  0x0000  soft_reset_rw       W: trigger soft reset (loads reset_cycles counter)
-//                              R: softResetDoneReg (1 = reset complete)
-//  0x0010  enable_rw           R/W: io.enable
-//  0x0020  entry_addr_rw       R/W: io.entryAddr
-//  0x0030  entry_addr_we_rw    W: pulse io.entryAddr_we for one cycle
-//                              R: always 0
-//  0x0040  running_r           R: io.running
-//  0x0050  debug_pc_r          R: io.debugPC
-//  0x0060  debug_cycles_lo_r   R: io.debugCycles[31:0]
-//  0x0070  debug_cycles_hi_r   R: io.debugCycles[63:32]
-//  0x0080  debug_status_r      R: {28'd0, ecall, illegalInst, halted, running}
+//  0x0000  soft_reset_rw     [RW] Write 1 to trigger soft reset; read 1 when done
+//  0x0010  enable_rw         [RW] CPU enable (1 = running, 0 = halted/idle)
+//  0x0020  entry_addr_rw     [RW] Entry address (PC loaded when enable=0 and we written)
+//  0x0030  entry_addr_we_rw  [RW] Write 1 to latch entry_addr into PC (auto-clears)
+//  0x0040  status_r          [R]  Status bits:
+//                                   [0] running
+//                                   [1] halted
+//                                   [2] illegalInst
+//                                   [3] ecall
+//  0x0050  debug_pc_r        [R]  Current PC
+//  0x0060  debug_cycles_lo_r [R]  Cycle counter [31:0]
+//  0x0070  debug_cycles_hi_r [R]  Cycle counter [63:32]
 //
-//  Debug register file (32 registers, read-only):
-//  0x0100 + i*0x10  debug_regs_base_r[i]  R: debugRegs[i], i=0..31
+//  Debug registers (x0..x31):
+//  0x0200 + i*0x10  debug_reg[i]_r  [R]  GPR x<i> value  (i = 0..31)
 //
-//  Instruction memory window (host-accessible when enable=0):
-//  0x1000 + i*0x10  imem_base_rw[i]       R/W: imem[i], i=0..imem_depth-1
+//  Instruction memory window (imem):
+//  0x1000 + i*0x10  imem[i]_rw  [RW]  Instruction word at word index i
+//                                      (accessible only while enable=0)
+//                                      Depth = imem_depth words
 //
-//  Data memory window (host-accessible when enable=0):
-//  0x5000 + i*0x10  dmem_base_rw[i]       R/W: dmem[i], i=0..dmem_depth-1
+//  Data memory window (dmem):
+//  0x5000 + i*0x10  dmem[i]_rw  [RW]  Data word at word index i
+//                                      (accessible only while enable=0)
+//                                      Depth = dmem_depth words
 //
 // =============================================================================
 
@@ -39,22 +44,22 @@ import chisel3.util._
 
 case class SRV32IModuleParams(
   // addresses (suffixed _r, _w, or _rw)
-  soft_reset_rw      : Long,
-  enable_rw          : Long,
-  entry_addr_rw      : Long,
-  entry_addr_we_rw   : Long,
-  running_r          : Long,
-  debug_pc_r         : Long,
-  debug_cycles_lo_r  : Long,
-  debug_cycles_hi_r  : Long,
-  debug_status_r     : Long,
-  debug_regs_base_r  : Long,   // 32 regs × 0x10 = 0x200 bytes
-  imem_base_rw       : Long,   // imem_depth regs × 0x10
-  dmem_base_rw       : Long,   // dmem_depth regs × 0x10
-  // non-address params
-  imem_depth         : Int,
-  dmem_depth         : Int,
-  reset_cycles       : Int,
+  soft_reset_rw     : Long,
+  enable_rw         : Long,
+  entry_addr_rw     : Long,
+  entry_addr_we_rw  : Long,
+  status_r          : Long,
+  debug_pc_r        : Long,
+  debug_cycles_lo_r : Long,
+  debug_cycles_hi_r : Long,
+  debug_regs_base_r : Long,   // base of 32 debug-register slots (0x10 each)
+  imem_base_rw      : Long,   // base of imem window
+  dmem_base_rw      : Long,   // base of dmem window
+  // memory geometry
+  imem_depth        : Int,
+  dmem_depth        : Int,
+  // soft-reset
+  reset_cycles      : Int,
 ) extends AxiModuleParams with AxiModuleDefParams {
   val moduleName = "SRV32I"
 }
@@ -62,25 +67,21 @@ case class SRV32IModuleParams(
 object SRV32IModuleParams {
   implicit val rw: ReadWriter[SRV32IModuleParams] = macroRW
 
-  def default(
-    imem_depth: Int = 1024,
-    dmem_depth: Int = 1024,
-  ): SRV32IModuleParams = new SRV32IModuleParams(
+  def default(): SRV32IModuleParams = new SRV32IModuleParams(
     soft_reset_rw     = 0x0000L,
     enable_rw         = 0x0010L,
     entry_addr_rw     = 0x0020L,
     entry_addr_we_rw  = 0x0030L,
-    running_r         = 0x0040L,
+    status_r          = 0x0040L,
     debug_pc_r        = 0x0050L,
     debug_cycles_lo_r = 0x0060L,
     debug_cycles_hi_r = 0x0070L,
-    debug_status_r    = 0x0080L,
-    debug_regs_base_r = 0x0100L,  // 0x0100 .. 0x01F0  (32 regs)
-    imem_base_rw      = 0x1000L,  // 0x1000 .. 0x1000 + imem_depth*0x10 - 0x10
-    dmem_base_rw      = 0x5000L,  // 0x5000 .. 0x5000 + dmem_depth*0x10 - 0x10
-    imem_depth        = imem_depth,
-    dmem_depth        = dmem_depth,
-    reset_cycles      = 16,
+    debug_regs_base_r = 0x0200L,  // 0x0200 .. 0x03F0  (32 regs × 0x10)
+    imem_base_rw      = 0x1000L,  // 0x1000 .. 0x1FF0  (up to 512 words × 0x10)
+    dmem_base_rw      = 0x5000L,  // 0x5000 .. 0x5FF0  (up to 256 words × 0x10)
+    imem_depth        = 512,
+    dmem_depth        = 256,
+    reset_cycles      = 8,
   )
 }
 
@@ -113,16 +114,17 @@ class AxiSRV32I(p: SRV32IModuleParams, debugprint: Boolean = false)
   // -------------------------------------------------------------------------
   // Control registers
   // -------------------------------------------------------------------------
-  val enableReg    = RegInit(false.B)
-  val entryAddrReg = RegInit(0.U(32.W))
+  val enableReg       = RegInit(false.B)
+  val entryAddrReg    = RegInit(0.U(32.W))
+  val entryAddrWeReg  = RegInit(false.B)   // single-cycle pulse, auto-clears
 
   // -------------------------------------------------------------------------
-  // Instruction memory (host-side SyncReadMem, word-addressed)
+  // Instruction memory (SyncReadMem, byte-maskable)
   // -------------------------------------------------------------------------
   val imem = SyncReadMem(p.imem_depth, Vec(4, UInt(8.W)))
 
   // -------------------------------------------------------------------------
-  // Data memory (host-side SyncReadMem, word-addressed)
+  // Data memory (SyncReadMem, byte-maskable)
   // -------------------------------------------------------------------------
   val dmem = SyncReadMem(p.dmem_depth, Vec(4, UInt(8.W)))
 
@@ -134,34 +136,39 @@ class AxiSRV32I(p: SRV32IModuleParams, debugprint: Boolean = false)
   dut.io.enable       := enableReg
   dut.io.softReset    := softResetReg
   dut.io.entryAddr    := entryAddrReg
-  dut.io.entryAddr_we := false.B   // pulsed from write path
+  dut.io.entryAddr_we := entryAddrWeReg
 
-  // ---- Instruction memory connections ----
-  // DUT reads imem (word-addressed, combinational address, data next cycle)
-  // We expose the same SyncReadMem to the host for loading programs.
-  val imemWordAddr = dut.io.imem.addr >> 2
-  val imemDutRen   = !enableReg  // only read by DUT when running; we always allow
-  // Actually we always let the DUT read; the SyncReadMem read port is shared.
-  // DUT read port
-  val imemDutRdata = imem.read(imemWordAddr)
-  dut.io.imem.inst := imemDutRdata.asUInt
-
-  // ---- Data memory connections ----
-  val dmemWordAddr = dut.io.dmem.addr >> 2
-  // DUT write port
-  when(dut.io.dmem.wen) {
-    val wdataVec = VecInit((0 until 4).map(i => dut.io.dmem.wdata(8 * i + 7, 8 * i)))
-    dmem.write(dmemWordAddr, wdataVec, dut.io.dmem.wmask.asBools)
-  }
-  // DUT read port (always enabled; data valid next cycle = sMem state)
-  val dmemDutRdata = dmem.read(dmemWordAddr)
-  dut.io.dmem.rdata := dmemDutRdata.asUInt
+  // Auto-clear entryAddr_we after one cycle
+  when(entryAddrWeReg) { entryAddrWeReg := false.B }
 
   // -------------------------------------------------------------------------
-  // AXI-Lite write path
+  // Connect imem to DUT
+  // -------------------------------------------------------------------------
+  // The DUT presents imem.addr combinationally; we use SyncReadMem so the
+  // data is available the next cycle (matches the DUT's sFetch -> sExec
+  // pipeline: address stable in sFetch, data consumed in sExec).
+  val imemWordAddr = dut.io.imem.addr >> 2
+  val imemRdVec    = imem.read(imemWordAddr)
+  dut.io.imem.inst := imemRdVec.asUInt
+
+  // -------------------------------------------------------------------------
+  // Connect dmem to DUT
+  // -------------------------------------------------------------------------
+  val dmemWordAddr = dut.io.dmem.addr >> 2
+  // Write path
+  val dmemWdataVec = VecInit((0 until 4).map(i => dut.io.dmem.wdata(8 * i + 7, 8 * i)))
+  when(dut.io.dmem.wen) {
+    dmem.write(dmemWordAddr, dmemWdataVec, dut.io.dmem.wmask.asBools)
+  }
+  // Read path (registered; DUT reads in sMem state, one cycle after sExec)
+  val dmemRdVec = dmem.read(dmemWordAddr, !dut.io.dmem.wen)
+  dut.io.dmem.rdata := dmemRdVec.asUInt
+
+  // -------------------------------------------------------------------------
+  // AXI-Lite Write Path
   // -------------------------------------------------------------------------
   val awHoldValidReg = RegInit(false.B)
-  val awHoldAddrReg  = Reg(UInt(32.W))
+  val awHoldAddrReg  = Reg(UInt(20.W))
   val wHoldValidReg  = RegInit(false.B)
   val wHoldDataReg   = Reg(UInt(32.W))
   val wHoldStrbReg   = Reg(UInt(4.W))
@@ -204,22 +211,27 @@ class AxiSRV32I(p: SRV32IModuleParams, debugprint: Boolean = false)
     }.elsewhen(a === p.entry_addr_rw.U) {
       entryAddrReg := wdata
     }.elsewhen(a === p.entry_addr_we_rw.U) {
-      // pulse entryAddr_we; entryAddr must already be set
-      dut.io.entryAddr_we := true.B
+      entryAddrWeReg := wdata(0)
     }.elsewhen(a >= p.imem_base_rw.U &&
-               a <  (p.imem_base_rw + p.imem_depth.toLong * 0x10L).U) {
-      // host write to instruction memory (word-addressed)
-      val offset   = a - p.imem_base_rw.U
-      val wordIdx  = offset >> 4   // divide by 0x10
-      val wdataVec = VecInit((0 until 4).map(i => wdata(8 * i + 7, 8 * i)))
-      imem.write(wordIdx, wdataVec, "b1111".U.asBools)
+               a < (p.imem_base_rw + p.imem_depth.toLong * 0x10L).U) {
+      // imem write: only when CPU is disabled
+      when(!enableReg) {
+        val idx      = (a - p.imem_base_rw.U) >> 4
+        val wdataVec = VecInit((0 until 4).map(i => wdata(8 * i + 7, 8 * i)))
+        imem.write(idx, wdataVec, wHoldStrbReg.asBools)
+      }.otherwise {
+        bresp := SLVERR.U
+      }
     }.elsewhen(a >= p.dmem_base_rw.U &&
-               a <  (p.dmem_base_rw + p.dmem_depth.toLong * 0x10L).U) {
-      // host write to data memory (word-addressed)
-      val offset   = a - p.dmem_base_rw.U
-      val wordIdx  = offset >> 4
-      val wdataVec = VecInit((0 until 4).map(i => wdata(8 * i + 7, 8 * i)))
-      dmem.write(wordIdx, wdataVec, "b1111".U.asBools)
+               a < (p.dmem_base_rw + p.dmem_depth.toLong * 0x10L).U) {
+      // dmem write: only when CPU is disabled
+      when(!enableReg) {
+        val idx      = (a - p.dmem_base_rw.U) >> 4
+        val wdataVec = VecInit((0 until 4).map(i => wdata(8 * i + 7, 8 * i)))
+        dmem.write(idx, wdataVec, wHoldStrbReg.asBools)
+      }.otherwise {
+        bresp := SLVERR.U
+      }
     }.otherwise {
       bresp := SLVERR.U
     }
@@ -237,7 +249,7 @@ class AxiSRV32I(p: SRV32IModuleParams, debugprint: Boolean = false)
   S.AXI.bresp  := brespReg
 
   // -------------------------------------------------------------------------
-  // AXI-Lite read path
+  // AXI-Lite Read Path
   // -------------------------------------------------------------------------
   val rdataReg = Reg(UInt(32.W))
   val rrespReg = RegInit(0.U(2.W))
@@ -248,6 +260,10 @@ class AxiSRV32I(p: SRV32IModuleParams, debugprint: Boolean = false)
 
   val rstateReg = RegInit(RState.READY2READ)
 
+  // Registers to remember what kind of memory read is pending
+  val pendingImem = RegInit(false.B)
+  val pendingDmem = RegInit(false.B)
+
   S.AXI.arready := rstateReg === RState.READY2READ
   S.AXI.rvalid  := rstateReg === RState.COMPLETED
   S.AXI.rdata   := rdataReg
@@ -255,104 +271,83 @@ class AxiSRV32I(p: SRV32IModuleParams, debugprint: Boolean = false)
 
   val arFire = S.AXI.arvalid && S.AXI.arready
 
-  // Registers to hold the pending memory read type and index
-  val memReadIsImem = RegInit(false.B)
-  val memReadIdx    = Reg(UInt(32.W))
+  // SyncReadMem read enables for the host-side read path
+  val hostImemRen  = WireDefault(false.B)
+  val hostDmemRen  = WireDefault(false.B)
+  val hostImemIdx  = Wire(UInt(log2Ceil(p.imem_depth).W))
+  val hostDmemIdx  = Wire(UInt(log2Ceil(p.dmem_depth).W))
+  hostImemIdx := 0.U
+  hostDmemIdx := 0.U
 
-  // Host-side SyncReadMem read ports (registered; data valid one cycle later)
-  // We issue the read in READY2READ and capture in WAIT_MEM -> COMPLETED.
-  val imemHostRen  = WireDefault(false.B)
-  val imemHostIdx  = WireDefault(0.U(32.W))
-  val dmemHostRen  = WireDefault(false.B)
-  val dmemHostIdx  = WireDefault(0.U(32.W))
-
-  val imemHostRdata = imem.read(imemHostIdx, imemHostRen)
-  val dmemHostRdata = dmem.read(dmemHostIdx, dmemHostRen)
+  // Separate SyncReadMem read ports for host access
+  val hostImemRdVec = imem.read(hostImemIdx, hostImemRen)
+  val hostDmemRdVec = dmem.read(hostDmemIdx, hostDmemRen)
 
   when(arFire) {
     if (debugprint) printf("%d: arFire: %x\n", cycles, S.AXI.araddr)
     val araddr = S.AXI.araddr(19, 0)
     rrespReg := OKAY.U
 
-    val nextState = WireDefault(RState.COMPLETED)
+    val rstate = WireDefault(RState.COMPLETED)
 
     when(araddr === p.soft_reset_rw.U) {
-      rdataReg := softResetDoneReg.asUInt
-
+      rdataReg := softResetDoneReg
     }.elsewhen(araddr === p.enable_rw.U) {
-      rdataReg := enableReg.asUInt
-
+      rdataReg := enableReg
     }.elsewhen(araddr === p.entry_addr_rw.U) {
       rdataReg := entryAddrReg
-
     }.elsewhen(araddr === p.entry_addr_we_rw.U) {
-      rdataReg := 0.U
-
-    }.elsewhen(araddr === p.running_r.U) {
-      rdataReg := dut.io.running.asUInt
-
-    }.elsewhen(araddr === p.debug_pc_r.U) {
-      rdataReg := dut.io.debugPC
-
-    }.elsewhen(araddr === p.debug_cycles_lo_r.U) {
-      rdataReg := dut.io.debugCycles(31, 0)
-
-    }.elsewhen(araddr === p.debug_cycles_hi_r.U) {
-      rdataReg := dut.io.debugCycles(63, 32)
-
-    }.elsewhen(araddr === p.debug_status_r.U) {
+      rdataReg := entryAddrWeReg
+    }.elsewhen(araddr === p.status_r.U) {
       rdataReg := Cat(0.U(28.W),
                       dut.io.debugStatus.ecall,
                       dut.io.debugStatus.illegalInst,
                       dut.io.debugStatus.halted,
                       dut.io.debugStatus.running)
-
+    }.elsewhen(araddr === p.debug_pc_r.U) {
+      rdataReg := dut.io.debugPC
+    }.elsewhen(araddr === p.debug_cycles_lo_r.U) {
+      rdataReg := dut.io.debugCycles(31, 0)
+    }.elsewhen(araddr === p.debug_cycles_hi_r.U) {
+      rdataReg := dut.io.debugCycles(63, 32)
     }.elsewhen(araddr >= p.debug_regs_base_r.U &&
-               araddr <  (p.debug_regs_base_r + 32L * 0x10L).U) {
-      // debug register file: 32 entries
-      val offset  = araddr - p.debug_regs_base_r.U
-      val regIdx  = offset >> 4
-      // Mux over all 32 debug registers (combinational Mem read)
-      rdataReg := MuxLookup(regIdx, 0.U)(
-        (0 until 32).map(i => i.U -> dut.io.debugRegs(i))
-      )
-
+               araddr < (p.debug_regs_base_r + 32L * 0x10L).U) {
+      val idx = (araddr - p.debug_regs_base_r.U) >> 4
+      rdataReg := dut.io.debugRegs(idx)
     }.elsewhen(araddr >= p.imem_base_rw.U &&
-               araddr <  (p.imem_base_rw + p.imem_depth.toLong * 0x10L).U) {
-      val offset = araddr - p.imem_base_rw.U
-      val idx    = offset >> 4
-      imemHostRen := true.B
-      imemHostIdx := idx
-      memReadIsImem := true.B
-      memReadIdx    := idx
-      nextState := RState.WAIT_MEM
-
+               araddr < (p.imem_base_rw + p.imem_depth.toLong * 0x10L).U) {
+      val idx = (araddr - p.imem_base_rw.U) >> 4
+      hostImemIdx := idx
+      hostImemRen := true.B
+      pendingImem := true.B
+      pendingDmem := false.B
+      rstate      := RState.WAIT_MEM
     }.elsewhen(araddr >= p.dmem_base_rw.U &&
-               araddr <  (p.dmem_base_rw + p.dmem_depth.toLong * 0x10L).U) {
-      val offset = araddr - p.dmem_base_rw.U
-      val idx    = offset >> 4
-      dmemHostRen := true.B
-      dmemHostIdx := idx
-      memReadIsImem := false.B
-      memReadIdx    := idx
-      nextState := RState.WAIT_MEM
-
+               araddr < (p.dmem_base_rw + p.dmem_depth.toLong * 0x10L).U) {
+      val idx = (araddr - p.dmem_base_rw.U) >> 4
+      hostDmemIdx := idx
+      hostDmemRen := true.B
+      pendingImem := false.B
+      pendingDmem := true.B
+      rstate      := RState.WAIT_MEM
     }.otherwise {
       if (debugprint) printf("%d: bad read req %x\n", cycles, araddr)
       rdataReg := 0xbad00000L.U | S.AXI.araddr(31, 0)
     }
 
-    rstateReg := nextState
+    rstateReg := rstate
   }
 
-  // WAIT_MEM: SyncReadMem data is available this cycle (issued last cycle)
+  // One cycle after issuing the SyncReadMem read, capture the result
   when(rstateReg === RState.WAIT_MEM) {
-    when(memReadIsImem) {
-      rdataReg := imemHostRdata.asUInt
-    }.otherwise {
-      rdataReg := dmemHostRdata.asUInt
+    when(pendingImem) {
+      rdataReg := hostImemRdVec.asUInt
+    }.elsewhen(pendingDmem) {
+      rdataReg := hostDmemRdVec.asUInt
     }
-    rstateReg := RState.COMPLETED
+    pendingImem := false.B
+    pendingDmem := false.B
+    rstateReg   := RState.COMPLETED
   }
 
   when(rstateReg === RState.COMPLETED && S.AXI.rready) {

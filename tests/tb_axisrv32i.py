@@ -2,45 +2,34 @@ import cocotb
 from axi_test_bridge.cocotb_bridge import COCOTB_Bridge
 
 # ---------------------------------------------------------------------------
-# Bit-mask constants for debug_status_r
-#   bits: {28'd0, ecall[3], illegalInst[2], halted[1], running[0]}
+# Status register bit masks (status_r, offset 0x0040)
+#   [0] running
+#   [1] halted
+#   [2] illegalInst
+#   [3] ecall
 # ---------------------------------------------------------------------------
-ST_RUNNING      = 1 << 0
-ST_HALTED       = 1 << 1
-ST_ILLEGAL_INST = 1 << 2
-ST_ECALL        = 1 << 3
-
-# Maximum poll iterations before declaring a timeout
-MAX_POLL = 100_000
-
-
-# ---------------------------------------------------------------------------
-# Helper: load a list of 32-bit words into instruction memory
-# ---------------------------------------------------------------------------
-async def load_imem(dut, words):
-    for i, w in enumerate(words):
-        addr = dut.p.imem_base_rw + i * 0x10
-        await dut.writeWord(addr, w & 0xFFFF_FFFF)
-
+ST_RUNNING     = 1 << 0
+ST_HALTED      = 1 << 1
+ST_ILLEGAL     = 1 << 2
+ST_ECALL       = 1 << 3
 
 # ---------------------------------------------------------------------------
-# Helper: load a list of 32-bit words into data memory
+# RISC-V encodings used in hand-assembled test programs
 # ---------------------------------------------------------------------------
-async def load_dmem(dut, words):
-    for i, w in enumerate(words):
-        addr = dut.p.dmem_base_rw + i * 0x10
-        await dut.writeWord(addr, w & 0xFFFF_FFFF)
-
+ECALL          = 0x00000073   # environment call – the documented halt cause
 
 # ---------------------------------------------------------------------------
-# Helper: poll debug_status_r until halted or ecall, bounded by MAX_POLL
+# Helper: poll status register until the expected bits are set (or timeout)
 # ---------------------------------------------------------------------------
-async def poll_until_done(dut):
-    for i in range(MAX_POLL):
-        status = await dut.readWord(dut.p.debug_status_r)
-        if status & (ST_HALTED | ST_ECALL | ST_ILLEGAL_INST):
-            return status
-    raise TimeoutError(f"CPU did not halt within {MAX_POLL} poll iterations")
+async def poll_status(dut, mask, timeout=50000):
+    for _ in range(timeout):
+        st = await dut.readWord(dut.p.status_r)
+        if (st & mask) == mask:
+            return st
+    raise TimeoutError(
+        f"Timed out waiting for status mask 0x{mask:08x}; "
+        f"last status=0x{st:08x}"
+    )
 
 
 @cocotb.test()
@@ -48,159 +37,167 @@ async def tb_axisrv32i(cocotb_dut):
     dut = COCOTB_Bridge(cocotb_dut)
     await dut.setup()
 
-    # ------------------------------------------------------------------
-    # 1. Verify initial state: enable=0, entry_addr=0, not running
-    # ------------------------------------------------------------------
-    dut.log.info("=== Check initial register state ===")
-    await dut.expectWord(dut.p.enable_rw,       0, msg="enable should be 0 at reset")
-    await dut.expectWord(dut.p.entry_addr_rw,   0, msg="entry_addr should be 0 at reset")
-    await dut.expectWord(dut.p.running_r,        0, msg="running should be 0 at reset")
-    await dut.expectWord(dut.p.entry_addr_we_rw, 0, msg="entry_addr_we read should always be 0")
+    # -----------------------------------------------------------------------
+    # 1. Verify initial state: CPU should be disabled / not running
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 1. Check initial state ===")
+    en = await dut.readWord(dut.p.enable_rw)
+    dut.log.info(f"enable_rw = {en:#010x}")
+    assert en == 0, f"Expected CPU disabled at reset, got {en:#010x}"
 
-    # ------------------------------------------------------------------
-    # 2. Write / read-back control registers while disabled
-    # ------------------------------------------------------------------
-    dut.log.info("=== Write/read-back control registers ===")
+    st = await dut.readWord(dut.p.status_r)
+    dut.log.info(f"status_r  = {st:#010x}")
+    # CPU is not running; halted bit may or may not be set depending on
+    # reset state – we just confirm the running bit is clear.
+    assert (st & ST_RUNNING) == 0, \
+        f"CPU should not be running after reset, status={st:#010x}"
 
-    test_entry = 0x0000_0000
-    await dut.writeWord(dut.p.entry_addr_rw, test_entry)
-    await dut.expectWord(dut.p.entry_addr_rw, test_entry,
-                         msg="entry_addr round-trip failed")
-
-    # Pulse entry_addr_we (write-only strobe; read always returns 0)
-    await dut.writeWord(dut.p.entry_addr_we_rw, 1)
-    await dut.expectWord(dut.p.entry_addr_we_rw, 0,
-                         msg="entry_addr_we read should always be 0")
-
-    # ------------------------------------------------------------------
-    # 3. Load a minimal RISC-V program into imem
+    # -----------------------------------------------------------------------
+    # 2. Load a minimal RISC-V program into imem while CPU is disabled.
     #
-    #    We use a tiny hand-encoded RV32I program that:
-    #      [0] addi x1, x0, 42      -- x1 = 42  (0x02A00093)
-    #      [1] sw   x1, 0(x0)       -- dmem[0] = x1 (0x00102023)
-    #      [2] ecall                -- halt     (0x00000073)
+    #    Program (word indices 0..):
+    #      0: addi x1, x0, 42    -> 0x02a00093
+    #      1: addi x2, x0, 7     -> 0x00700113
+    #      2: add  x3, x1, x2    -> 0x002081b3
+    #      3: sw   x3, 0(x0)     -> 0x00302023  (store result to dmem[0])
+    #      4: ecall               -> 0x00000073  (halt)
     #
-    #    SRV32I only decodes ecall (imm[11:0]==0) as a legal halt-causing
-    #    instruction -- ebreak (imm[11:0]==1) is NOT implemented and will
-    #    trap as illegalInst instead of ecall.
-    #
-    #    After execution:
-    #      - debug_status_r should have ST_HALTED and ST_ECALL set
-    #      - debug_regs[1] should be 42
-    #      - dmem[0] should be 42
-    #      - debug_pc_r should point at the ecall instruction (word 2 = 0x8)
-    #        NOTE: per the core design, PC does not advance past the
-    #        halt-causing instruction, so debug_pc_r == 0x8.
-    # ------------------------------------------------------------------
-    dut.log.info("=== Load program into imem ===")
+    #    Expected: x1=42, x2=7, x3=49, dmem[0]=49
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 2. Load instruction memory ===")
 
     program = [
-        0x02A00093,   # addi x1, x0, 42
-        0x00102023,   # sw   x1, 0(x0)
-        0x00000073,   # ecall  (halts the core)
+        0x02a00093,   # addi x1, x0, 42
+        0x00700113,   # addi x2, x0, 7
+        0x002081b3,   # add  x3, x1, x2
+        0x00302023,   # sw   x3, 0(x0)
+        ECALL,        # ecall  (halt)
     ]
-    await load_imem(dut, program)
 
-    # Verify imem round-trip
-    for i, expected in enumerate(program):
-        addr = dut.p.imem_base_rw + i * 0x10
+    p = dut.p
+    for i, instr in enumerate(program):
+        addr = p.imem_base_rw + i * 0x10
+        await dut.writeWord(addr, instr)
+        dut.log.info(f"  imem[{i}] @ {addr:#06x} <- {instr:#010x}")
+
+    # Verify a couple of written words read back correctly
+    for i, instr in enumerate(program):
+        addr = p.imem_base_rw + i * 0x10
         v = await dut.readWord(addr)
-        assert v == expected, (
-            f"imem[{i}] round-trip failed: got 0x{v:08x}, expected 0x{expected:08x}"
-        )
-    dut.log.info("imem load verified")
+        assert v == instr, \
+            f"imem[{i}] readback mismatch: expected {instr:#010x}, got {v:#010x}"
+    dut.log.info("  imem readback OK")
 
-    # ------------------------------------------------------------------
-    # 4. Set entry address and enable the CPU
-    # ------------------------------------------------------------------
-    dut.log.info("=== Set entry address and enable CPU ===")
+    # -----------------------------------------------------------------------
+    # 3. Set entry address to 0 and latch it
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 3. Set entry address ===")
+    await dut.writeWord(p.entry_addr_rw, 0x00000000)
+    v = await dut.readWord(p.entry_addr_rw)
+    assert v == 0, f"entry_addr_rw readback: {v:#010x}"
 
-    await dut.writeWord(dut.p.entry_addr_rw, 0x0000_0000)
-    await dut.writeWord(dut.p.entry_addr_we_rw, 1)   # latch entry address into DUT
-    await dut.writeWord(dut.p.enable_rw, 1)
+    # Latch the entry address into the PC
+    await dut.writeWord(p.entry_addr_we_rw, 1)
+    dut.log.info("  entry_addr_we pulsed")
 
-    v = await dut.readWord(dut.p.enable_rw)
-    assert v == 1, f"enable register should read 1, got {v}"
+    # -----------------------------------------------------------------------
+    # 4. Enable the CPU and wait for ecall halt
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 4. Enable CPU and wait for ecall ===")
+    await dut.writeWord(p.enable_rw, 1)
 
-    # ------------------------------------------------------------------
-    # 5. Poll until the CPU halts
-    # ------------------------------------------------------------------
-    dut.log.info("=== Polling for CPU halt ===")
-    status = await poll_until_done(dut)
-    dut.log.info(f"CPU stopped: debug_status_r = 0x{status:08x}")
+    en = await dut.readWord(p.enable_rw)
+    dut.log.info(f"  enable_rw = {en:#010x}")
+    assert en == 1, f"enable_rw should be 1, got {en:#010x}"
 
-    assert status & ST_HALTED, (
-        f"Expected ST_HALTED bit set, got status=0x{status:08x}"
-    )
-    assert status & ST_ECALL, (
-        f"Expected ST_ECALL bit set, got status=0x{status:08x}"
-    )
-    assert not (status & ST_ILLEGAL_INST), (
-        f"Unexpected illegal instruction flag in status=0x{status:08x}"
-    )
+    # Poll until ecall (and halted) bits are set
+    st = await poll_status(dut, ST_ECALL | ST_HALTED)
+    dut.log.info(f"  status_r  = {st:#010x}  (halted via ecall)")
 
-    # ------------------------------------------------------------------
-    # 6. Check debug PC
-    #    ebreak is at word index 2 => byte address 0x8.
-    #    The PC does not advance past the halt-causing instruction.
-    # ------------------------------------------------------------------
-    dut.log.info("=== Check debug PC ===")
-    pc = await dut.readWord(dut.p.debug_pc_r)
-    dut.log.info(f"debug_pc = 0x{pc:08x}")
-    assert pc == 0x8, f"Expected PC=0x8 (ebreak), got PC=0x{pc:08x}"
+    assert (st & ST_ECALL)   != 0, f"ecall bit not set: {st:#010x}"
+    assert (st & ST_HALTED)  != 0, f"halted bit not set: {st:#010x}"
+    assert (st & ST_ILLEGAL) == 0, \
+        f"illegalInst bit unexpectedly set: {st:#010x}"
+    assert (st & ST_RUNNING) == 0, \
+        f"running bit should be clear after halt: {st:#010x}"
 
-    # ------------------------------------------------------------------
-    # 7. Check debug register file: x1 should be 42
-    # ------------------------------------------------------------------
-    dut.log.info("=== Check debug register file ===")
-    reg1_addr = dut.p.debug_regs_base_r + 1 * 0x10
-    reg1 = await dut.readWord(reg1_addr)
-    dut.log.info(f"debug_regs[1] = {reg1}")
-    assert reg1 == 42, f"Expected x1=42, got {reg1}"
+    # -----------------------------------------------------------------------
+    # 5. Inspect debug registers and PC
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 5. Inspect debug state ===")
 
-    # x0 must always be 0
-    reg0_addr = dut.p.debug_regs_base_r + 0 * 0x10
-    reg0 = await dut.readWord(reg0_addr)
-    assert reg0 == 0, f"Expected x0=0, got {reg0}"
+    pc = await dut.readWord(p.debug_pc_r)
+    dut.log.info(f"  debug_pc_r = {pc:#010x}")
+    # PC should point at the ecall instruction (word index 4 = byte addr 16)
+    assert pc == 0x10, f"Expected PC=0x10 at ecall, got {pc:#010x}"
 
-    # ------------------------------------------------------------------
-    # 8. Check data memory: dmem[0] should be 42 (written by sw)
-    # ------------------------------------------------------------------
-    dut.log.info("=== Check data memory ===")
-    dmem0 = await dut.readWord(dut.p.dmem_base_rw)
-    dut.log.info(f"dmem[0] = {dmem0}")
-    assert dmem0 == 42, f"Expected dmem[0]=42, got {dmem0}"
+    # x0 is always 0
+    x0 = await dut.readWord(p.debug_regs_base_r + 0 * 0x10)
+    assert x0 == 0, f"x0 should be 0, got {x0:#010x}"
 
-    # ------------------------------------------------------------------
-    # 9. Check debug cycle counter is non-zero
-    # ------------------------------------------------------------------
-    dut.log.info("=== Check debug cycle counter ===")
-    cyc_lo = await dut.readWord(dut.p.debug_cycles_lo_r)
-    cyc_hi = await dut.readWord(dut.p.debug_cycles_hi_r)
+    # x1 = 42
+    x1 = await dut.readWord(p.debug_regs_base_r + 1 * 0x10)
+    dut.log.info(f"  x1 = {x1}")
+    assert x1 == 42, f"x1 expected 42, got {x1}"
+
+    # x2 = 7
+    x2 = await dut.readWord(p.debug_regs_base_r + 2 * 0x10)
+    dut.log.info(f"  x2 = {x2}")
+    assert x2 == 7, f"x2 expected 7, got {x2}"
+
+    # x3 = 49
+    x3 = await dut.readWord(p.debug_regs_base_r + 3 * 0x10)
+    dut.log.info(f"  x3 = {x3}")
+    assert x3 == 49, f"x3 expected 49, got {x3}"
+
+    # -----------------------------------------------------------------------
+    # 6. Inspect data memory: dmem[0] should contain 49 (result of sw)
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 6. Inspect data memory ===")
+    # dmem is only accessible while CPU is disabled; disable first
+    await dut.writeWord(p.enable_rw, 0)
+
+    dmem0 = await dut.readWord(p.dmem_base_rw + 0 * 0x10)
+    dut.log.info(f"  dmem[0] = {dmem0}")
+    assert dmem0 == 49, f"dmem[0] expected 49, got {dmem0}"
+
+    # -----------------------------------------------------------------------
+    # 7. Cycle counter sanity check (should be non-zero)
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 7. Cycle counter ===")
+    cyc_lo = await dut.readWord(p.debug_cycles_lo_r)
+    cyc_hi = await dut.readWord(p.debug_cycles_hi_r)
     cycles = (cyc_hi << 32) | cyc_lo
-    dut.log.info(f"debug_cycles = {cycles}")
-    assert cycles > 0, "Expected non-zero cycle count after program execution"
+    dut.log.info(f"  cycles = {cycles}")
+    assert cycles > 0, "Cycle counter should be non-zero after execution"
 
-    # ------------------------------------------------------------------
-    # 10. Soft reset: disable CPU first, then reset, verify state clears
-    # ------------------------------------------------------------------
-    dut.log.info("=== Soft reset ===")
-    await dut.writeWord(dut.p.enable_rw, 0)
-    await dut.expectWord(dut.p.enable_rw, 0, msg="enable should be 0 after disable")
+    # -----------------------------------------------------------------------
+    # 8. Soft reset: confirm state clears
+    # -----------------------------------------------------------------------
+    dut.log.info("=== 8. Soft reset ===")
+    # Ensure CPU is disabled before reset
+    await dut.writeWord(p.enable_rw, 0)
 
     await dut.softReset()
-    dut.log.info("Soft reset complete")
+    dut.log.info("  softReset() completed")
 
-    # After reset: enable, entry_addr, running should all be 0
-    await dut.expectWord(dut.p.enable_rw,     0, msg="enable should be 0 after soft reset")
-    await dut.expectWord(dut.p.entry_addr_rw, 0, msg="entry_addr should be 0 after soft reset")
-    await dut.expectWord(dut.p.running_r,      0, msg="running should be 0 after soft reset")
+    # After reset: enable should be 0, status should show not-running
+    en_after = await dut.readWord(p.enable_rw)
+    dut.log.info(f"  enable_rw after reset = {en_after:#010x}")
+    assert en_after == 0, \
+        f"enable_rw should be 0 after soft reset, got {en_after:#010x}"
 
-    # Status should show not running, not halted (core is in reset state)
-    status_after = await dut.readWord(dut.p.debug_status_r)
-    dut.log.info(f"debug_status after reset = 0x{status_after:08x}")
-    assert not (status_after & ST_RUNNING), (
-        f"CPU should not be running after soft reset, status=0x{status_after:08x}"
-    )
+    st_after = await dut.readWord(p.status_r)
+    dut.log.info(f"  status_r  after reset = {st_after:#010x}")
+    assert (st_after & ST_RUNNING) == 0, \
+        f"CPU should not be running after soft reset, status={st_after:#010x}"
+    assert (st_after & ST_ECALL) == 0, \
+        f"ecall bit should be clear after soft reset, status={st_after:#010x}"
+
+    # entry_addr should have been cleared
+    ea_after = await dut.readWord(p.entry_addr_rw)
+    dut.log.info(f"  entry_addr_rw after reset = {ea_after:#010x}")
+    assert ea_after == 0, \
+        f"entry_addr_rw should be 0 after soft reset, got {ea_after:#010x}"
 
     dut.log.info("Done!!\n")

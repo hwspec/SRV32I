@@ -51,6 +51,15 @@ def parse_package(dut_src: str) -> str:
     return m.group(1)
 
 
+def detect_example(dut_src: str) -> str:
+    """Picks the closer-shaped worked example based on the DUT's own IO:
+    Decoupled/Valid-Ready streaming ports look more like TestQ (a queue)
+    than Cmd (plain registers)."""
+    if re.search(r"\bDecoupled(IO)?\s*\(|\bValid\s*\(|Flipped\s*\(\s*Decoupled", dut_src):
+        return "testq"
+    return "cmd"
+
+
 def fetch_example(example: str) -> dict[str, str]:
     """Clones chisel-axi-utils and returns the Cmd or TestQ worked example
     (bridge scala source, cocotb testbench, Makefile)."""
@@ -123,7 +132,8 @@ Conventions you MUST follow, based on the worked example:
   `resetCounterReg` counting down from `p.reset_cycles`, and
   `combinedReset = softResetReg || reset.asBool`. The DUT is instantiated
   under `withReset(combinedReset) { Module(new <DUT>) }` AND is also given
-  an explicit `softReset` input if the DUT itself exposes one.
+  an explicit `softReset` input if the DUT itself exposes one. This part
+  is a fixed convention regardless of DUT type.
 - AXI-Lite write path: `awHoldValidReg`/`wHoldValidReg` hold address/data
   until both arrive, `doWrite` fires the register match `when/elsewhen` chain,
   `bvalidReg`/`brespReg` complete the response. Full-word writes only
@@ -133,23 +143,52 @@ Conventions you MUST follow, based on the worked example:
   extra 1-cycle read latency, since `SyncReadMem.read()` is registered.
   Address matching uses `araddr(19,0)` (1MB MMIO window). Unmapped addresses
   return `0xbad00000 | araddr` with `OKAY` (not `SLVERR`, per convention).
-- Any DUT memory ports (word-addressed, fixed 1-cycle SyncReadMem latency,
-  no handshake) are given host-accessible read/write windows in the register
-  map, typically gated to be writable/readable only while the DUT is
-  disabled, if the DUT has an enable/start control.
-- Byte-maskable memories MUST be declared `SyncReadMem(depth, Vec(4, UInt(8.W)))`,
-  never `SyncReadMem(depth, UInt(32.W))`. `SyncReadMem.write(addr, data, mask)`
-  requires `data: Vec[T]` so each mask bit lines up with one element — a flat
-  `UInt` will not compile with a mask argument. Slice the write data into
-  bytes before writing, and reassemble with `.asUInt` after reading:
+
+The remaining conventions below apply ONLY when the DUT actually has the
+corresponding kind of port. Map whatever the DUT exposes -- do not invent
+imem/dmem, entry points, or halt/status semantics for a DUT that has none
+of that; map its actual ports instead (see the two IO-shape cases below).
+
+- If the DUT has raw memory-like ports (a combinational address output
+  paired with a data input, fixed 1-cycle latency, no handshake -- the
+  `imem`/`dmem` pattern), give each one a host-accessible read/write window
+  in the register map, typically gated to be writable/readable only while
+  the DUT is disabled if the DUT has an enable/start control. Byte-maskable
+  memories MUST be declared `SyncReadMem(depth, Vec(4, UInt(8.W)))`, never
+  `SyncReadMem(depth, UInt(32.W))`. `SyncReadMem.write(addr, data, mask)`
+  requires `data: Vec[T]` so each mask bit lines up with one element -- a
+  flat `UInt` will not compile with a mask argument. Slice the write data
+  into bytes before writing, and reassemble with `.asUInt` after reading:
     val wdataVec = VecInit((0 until 4).map(i => wdata(8 * i + 7, 8 * i)))
     when(wen) { mem.write(idx, wdataVec, wmask.asBools) }
     val rdata = mem.read(idx, ren).asUInt
-  This applies to every masked-write memory in the bridge, including any
-  DUT-side data memory exposed through a host read/write window.
-- Debug/status outputs on the DUT are exposed as read-only registers.
-- Control inputs on the DUT (enable, reset, entry point, etc.) are exposed
-  as read/write registers, mapped 1:1.
+- If the DUT has `Decoupled`/`Valid`-`Ready` streaming ports (common on
+  accelerators: a data-in queue, a data-out queue, or both), map each such
+  port to a small register-mapped handshake instead of a SyncReadMem window:
+    - a data register (`_w` for an input queue: writing it asserts `valid`
+      for one cycle and supplies `bits`, only completing the AXI write once
+      the DUT's `ready` is high that cycle, else stall the write response
+      or return the transaction with a busy/retry indication per the
+      existing bvalid/brespReg mechanism -- keep the host-facing AXI
+      transaction itself always completing in bounded time, and instead
+      expose a separate `_ready_r` status bit the host is expected to poll
+      before writing, mirroring how `enable`-style control already works)
+    - a `_ready_r` or `_valid_r` status bit so the host can poll before
+      pushing/popping
+    - for an output queue: reading the data register pops one element only
+      if `valid` is high; otherwise return a defined sentinel and leave
+      a `_valid_r` bit for the host to check first
+  Base this handshake register shape on the repo's TestQ example if given
+  as the worked example, adapting names/addresses to the new DUT's actual
+  queue ports.
+- Any DUT status/done/completion output (whatever the DUT calls it -- not
+  necessarily "halted") is exposed as a read-only status register, with
+  each individual status bit given its own bit position and documented in
+  the register-map comment block, exactly as the DUT defines it -- do not
+  assume RISC-V-specific semantics like `ecall`/`illegalInst` unless the
+  DUT literally has those signals.
+- Every other plain control input on the DUT (enable, reset, any config or
+  parameter register, etc.) is exposed as a read/write register, mapped 1:1.
 - The file ends with:
     object Axi<Name> extends App {
       val p = checkParamEnv(<Name>ModuleParams.default(), "<NAME_UPPER>_MODULE_PARAMS")
@@ -157,12 +196,14 @@ Conventions you MUST follow, based on the worked example:
     }
 
 You will be given one complete worked example bridge (its own wrapped DUT
-may be much simpler than the new one). Study the *structural* pattern
-(params case class, register spacing, reset handling, read/write FSMs), not
-the specific registers it happens to define, then produce an equivalent,
-complete, compilable bridge that covers every IO port on the new DUT in the
-same style (naming, spacing, a comment block documenting the register map
-at the top of the file).
+may be a different shape than the new one -- e.g. simple register-mapped
+control, or a Decoupled queue, rather than a CPU). Study the *structural*
+pattern (params case class, register spacing, reset handling, read/write
+FSMs, and -- if the example uses one -- the streaming-queue handshake
+pattern), not the specific registers or port shape it happens to define,
+then produce an equivalent, complete, compilable bridge that covers every
+IO port on the new DUT in the same style (naming, spacing, a comment block
+documenting the register map at the top of the file).
 
 Output format: return exactly one file, as:
 
@@ -216,27 +257,39 @@ Conventions you MUST follow, based on the worked example:
 
 - Test file: `tb_<name_lowercase>.py`, using `@cocotb.test()` on an
   `async def tb_<name_lowercase>(cocotb_dut):` entry point.
-- Exercises the DUT via the register map end to end: for a CPU/core DUT,
-  this typically means: load any memory window(s) while disabled, set entry
-  point / control registers, enable, poll a status register for a
-  completion/halt condition (bounded loop, raise on timeout), then assert
-  final state (status bits, debug registers, memory contents) via readWord.
+- Exercises the DUT via the register map end to end, shaped by whatever the
+  bridge actually exposes:
+    - if the bridge has memory windows: load them while disabled, set any
+      entry-point/config registers, enable, poll a status register for
+      whatever the bridge's status register defines as its completion bit(s)
+      (bounded loop, raise on timeout), then assert final state (status
+      bits, debug/output registers, memory contents) via readWord.
+    - if the bridge has streaming/Decoupled register-mapped handshakes
+      (data-in / data-out queues), push input word(s) only after polling
+      the corresponding `_ready_r` bit, and pop output word(s) only after
+      polling the corresponding `_valid_r` bit, rather than assuming a
+      halt/status register drives completion.
+  Do not assume CPU-specific concepts (registers x0..x31, `ecall`, program
+  counter) unless the bridge's register map actually defines them.
 - Status/flag bits are decoded with named bit-mask constants at module level
-  (e.g. `ST_HALTED = 1 << 1`), matching the bridge's status register layout.
-  Where the DUT design gives specific documented semantics (e.g. "PC does
-  not advance on halt-causing instruction"), reflect that exactly in the
-  assertions rather than a generic check.
-- End with a soft-reset check: disable, call `await dut.softReset()`, then
-  read back registers to confirm state cleared.
+  (e.g. `ST_DONE = 1 << 1`), matching the bridge's actual status register
+  layout and bit names/comments -- do not invent bit names the bridge
+  doesn't document. Where the register map gives specific documented
+  semantics (e.g. "output does not update past the completion cycle"),
+  reflect that exactly in the assertions rather than a generic check.
+- If (and only if) the DUT is CPU-like and the register map documents an
+  `ecall`-style halt cause, use `ecall` (`0x00000073`) as the halt
+  instruction in any hand-encoded test program, NOT `ebreak` (`0x00100073`)
+  -- unless the register map's own comments explicitly document `ebreak`
+  support, assume only `ecall` is recognized; using `ebreak` will trap as
+  an illegal instruction instead and the test will falsely fail with the
+  illegal-instruction bit set instead of the ecall bit. This bullet does
+  not apply to non-CPU DUTs.
+- End with a soft-reset check: disable/quiesce the DUT, call
+  `await dut.softReset()`, then read back registers to confirm state
+  cleared -- this part is a fixed convention regardless of DUT type.
 - Use `dut.log.info(...)` for progress/debug lines, plain `assert` statements
   for checks (with an f-string message where it adds diagnostic value).
-- If the test program needs a halt-causing instruction, use `ecall`
-  (`0x00000073`, RV32I `SYSTEM` opcode with `imm[11:0] == 0`), NOT `ebreak`
-  (`0x00100073`, `imm[11:0] == 1`). Unless the DUT's decoder explicitly
-  documents `ebreak` support, assume only `ecall` is a legal halt cause —
-  using `ebreak` will trap as an illegal instruction instead and the test
-  will falsely fail with the illegal-instruction status bit set instead of
-  the ecall bit.
 
 Also generate the matching Makefile, following this exact structure (only
 substitute the module/package names):
@@ -321,17 +374,20 @@ def main():
     ap.add_argument("--dut-prefix", default=None,
                      help="name used for Axi<prefix>.scala / tb_<prefix>.py "
                           "(default: DUT filename without extension)")
-    ap.add_argument("--example", choices=["cmd", "testq"], default="cmd",
-                     help="which chisel-axi-utils worked example to use (default: cmd)")
+    ap.add_argument("--example", choices=["cmd", "testq"], default=None,
+                     help="which chisel-axi-utils worked example to use "
+                          "(default: auto-detected from the DUT's IO -- "
+                          "'testq' if it has Decoupled/Valid ports, else 'cmd')")
     args = ap.parse_args()
 
     dut_src = read(args.dut)
     package = parse_package(dut_src)
     dut_prefix = args.dut_prefix or Path(args.dut).stem
+    example_name = args.example or detect_example(dut_src)
 
     print(f"package: {package}, dut_prefix: {dut_prefix}")
-    print(f"fetching '{args.example}' worked example from chisel-axi-utils ...")
-    example = fetch_example(args.example)
+    print(f"fetching '{example_name}' worked example from chisel-axi-utils ...")
+    example = fetch_example(example_name)
 
     print(f"[1/2] generating AXI bridge for {dut_prefix} ...")
     bridge_files = generate_bridge(dut_src, example["bridge"], dut_prefix, package)

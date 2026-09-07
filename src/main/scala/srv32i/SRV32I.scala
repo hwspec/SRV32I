@@ -17,9 +17,9 @@ object ALU {
 
   def compute(op: UInt, a: UInt, b: UInt): UInt = {
     val shamt = b(4, 0)
-    MuxLookup(op, 0.U)(Seq(
-      ADD  -> (a + b),
-      SUB  -> (a - b),
+    MuxLookup(op, 0.U(32.W))(Seq(
+      ADD  -> (a +% b),          // fixed-width wrapping add, stays 32-bit
+      SUB  -> (a -% b),          // fixed-width wrapping sub, stays 32-bit
       SLL  -> (a << shamt)(31, 0),
       SLT  -> (a.asSInt < b.asSInt).asUInt,
       SLTU -> (a < b),
@@ -78,6 +78,9 @@ class DecodedInst extends Bundle {
   val isJAL    = Bool()
   val isJALR   = Bool()
   val isECALL  = Bool()
+  val isEBREAK = Bool()
+  val isFence  = Bool()
+  val isCustom = Bool()
   val illegal  = Bool()
 }
 
@@ -112,7 +115,18 @@ class Decoder extends Module {
   val isAUIPC  = opcode === "b0010111".U
   val isJAL    = opcode === "b1101111".U
   val isJALR   = opcode === "b1100111".U
-  val isECALL  = opcode === "b1110011".U && io.out.funct3 === 0.U && io.out.immI === 0.U
+  val isSystem = opcode === "b1110011".U && io.out.funct3 === 0.U
+  val isECALL  = isSystem && io.out.immI === 0.U
+  val isEBREAK = isSystem && io.out.immI === 1.U
+  // FENCE / FENCE.I both decode to opcode 0b0001111; treated as a NOP since
+  // this core is single-issue, in-order, non-caching -- there's nothing for
+  // either fence variant to actually order or invalidate.
+  val isFence  = opcode === "b0001111".U
+  // RISC-V reserves opcode 0b0001011 ("custom-0") for non-standard extensions.
+  // Reused here as the demo hook for a PPC rlwimi-style rotate/mask/insert op;
+  // it decodes with the same rd/rs1/rs2/funct3/funct7 fields as R-type, so
+  // adding another custom op needs no new decode logic -- see CustomOp below.
+  val isCustom = opcode === "b0001011".U
 
   io.out.isRType  := isRType
   io.out.isIType  := isIType
@@ -124,9 +138,12 @@ class Decoder extends Module {
   io.out.isJAL    := isJAL
   io.out.isJALR   := isJALR
   io.out.isECALL  := isECALL
+  io.out.isEBREAK := isEBREAK
+  io.out.isFence  := isFence
+  io.out.isCustom := isCustom
 
   val legal = isRType || isIType || isLoad || isStore || isBranch ||
-    isLUI || isAUIPC || isJAL || isJALR || isECALL
+    isLUI || isAUIPC || isJAL || isJALR || isECALL || isEBREAK || isFence || isCustom
   io.out.illegal := !legal
 }
 
@@ -146,6 +163,32 @@ object MemAccess {
   ))
 }
 
+// Dispatch table for custom-0 opcode instructions, keyed by funct3 (funct7 is
+// also available in SRV32I for sub-selecting variants if 8 funct3 slots aren't
+// enough). To add a new custom instruction:
+//   1. pick an unused funct3 code below
+//   2. add a case to `compute` that derives the result from the three operands
+//      SRV32I already wires in: rs1Data, rs2Data, and rdData (rd's *current*
+//      value, read before this instruction's writeback -- needed for any
+//      read-modify-write op like insert/merge instructions)
+//   3. if the op needs bits beyond rs1/rs2/rd/funct3/funct7 (e.g. rlwimi's
+//      SH/MB/ME fields), extend DecodedInst/Decoder with a dedicated custom
+//      immediate rather than overloading immI/immS/etc.
+// No other file needs to change: SRV32I wires isCustom into regWen/wbData
+// generically, so any op added here writes back automatically.
+object CustomOp {
+  val RLWIMI = 0.U(3.W) // funct3 = 000: rotate-left rs1 by shamt, insert into rd under mask
+
+  def compute(funct3: UInt, rs1Data: UInt, rs2Data: UInt, rdData: UInt): UInt = {
+    MuxLookup(funct3, rdData)(Seq(
+      // TODO: real rlwimi semantics -- result = (rotl(rs1Data, shamt) & mask) | (rdData & ~mask).
+      // shamt/mask need a dedicated immediate field (PPC packs SH/MB/ME in 15 bits,
+      // which doesn't fit funct7's 7 bits); stubbed as passthrough of rd until that
+      // encoding is defined, so the datapath/FSM plumbing below is exercised as-is.
+      RLWIMI -> rdData
+    ))
+  }
+}
 
 class RegFile extends Module {
   val io = IO(new Bundle {
@@ -153,6 +196,12 @@ class RegFile extends Module {
     val rs2Addr = Input(UInt(5.W))
     val rs1Data = Output(UInt(32.W))
     val rs2Data = Output(UInt(32.W))
+
+    // Third read port exposing rd's *current* value, addressed by rdAddr.
+    // Unused by the base ISA (which only ever writes rd), but read-modify-write
+    // custom ops (e.g. rlwimi-style insert/merge) need rd as a source too.
+    val rdAddr = Input(UInt(5.W))
+    val rdData = Output(UInt(32.W))
 
     val wen   = Input(Bool())
     val waddr = Input(UInt(5.W))
@@ -165,6 +214,7 @@ class RegFile extends Module {
 
   io.rs1Data := Mux(io.rs1Addr === 0.U, 0.U, regs.read(io.rs1Addr))
   io.rs2Data := Mux(io.rs2Addr === 0.U, 0.U, regs.read(io.rs2Addr))
+  io.rdData  := Mux(io.rdAddr === 0.U, 0.U, regs.read(io.rdAddr))
 
   when(io.wen && io.waddr =/= 0.U) {
     regs.write(io.waddr, io.wdata)
@@ -203,6 +253,7 @@ class SRV32I extends Module {
       val halted      = Bool()
       val illegalInst = Bool()
       val ecall       = Bool()
+      val ebreak      = Bool()
     })
   })
 
@@ -217,6 +268,7 @@ class SRV32I extends Module {
   val haltedReg  = RegInit(false.B)
   val illegalReg = RegInit(false.B)
   val ecallReg   = RegInit(false.B)
+  val ebreakReg  = RegInit(false.B)
   val cycleReg   = RegInit(0.U(64.W))
 
   val active = io.enable && !haltedReg
@@ -233,8 +285,10 @@ class SRV32I extends Module {
   val regFile = Module(new RegFile)
   regFile.io.rs1Addr := dec.rs1
   regFile.io.rs2Addr := dec.rs2
+  regFile.io.rdAddr  := dec.rd
   val rs1Data = regFile.io.rs1Data
   val rs2Data = regFile.io.rs2Data
+  val rdDataCur = regFile.io.rdData // rd's pre-writeback value, for custom read-modify-write ops
   io.debugRegs := regFile.io.debugRegs
 
   // ---------------- ALU ----------------
@@ -256,6 +310,9 @@ class SRV32I extends Module {
   }
   val aluOut = ALU.compute(aluCtrl, rs1Data, aluOp2)
 
+  // ---------------- Custom-0 ops ----------------
+  val customOut = CustomOp.compute(dec.funct3, rs1Data, rs2Data, rdDataCur)
+
   // ---------------- Branch ----------------
   val branchUnit = Module(new BranchUnit)
   branchUnit.io.funct3   := dec.funct3
@@ -265,17 +322,17 @@ class SRV32I extends Module {
   val branchTaken = branchUnit.io.taken
 
   // ---------------- Data memory ----------------
-  val memAddr = rs1Data + Mux(dec.isStore, dec.immS, dec.immI)
+  val memAddr = rs1Data +% Mux(dec.isStore, dec.immS, dec.immI)
   io.dmem.addr  := memAddr
   io.dmem.wdata := rs2Data
   io.dmem.wen   := false.B // set true only in sExec for stores
   io.dmem.wmask := MemAccess.storeMask(dec.funct3)
 
   // ---------------- Next PC / writeback values ----------------
-  val pcPlus4      = pcReg + 4.U
-  val branchTarget = pcReg + dec.immB
-  val jalTarget    = pcReg + dec.immJ
-  val jalrTarget   = (rs1Data + dec.immI) & ~1.U(32.W)
+  val pcPlus4      = pcReg +% 4.U(32.W)
+  val branchTarget = pcReg +% dec.immB
+  val jalTarget    = pcReg +% dec.immJ
+  val jalrTarget   = (rs1Data +% dec.immI) & ~1.U(32.W)
 
   val nextPCExec = MuxCase(pcPlus4, Seq(
     (dec.isBranch && branchTaken) -> branchTarget,
@@ -285,8 +342,9 @@ class SRV32I extends Module {
 
   val wbData = MuxCase(aluOut, Seq(
     dec.isLUI   -> dec.immU,
-    dec.isAUIPC -> (pcReg + dec.immU),
-    (dec.isJAL || dec.isJALR) -> pcPlus4
+    dec.isAUIPC -> (pcReg +% dec.immU),
+    (dec.isJAL || dec.isJALR) -> pcPlus4,
+    dec.isCustom -> customOut
   ))
 
   val regWen   = WireDefault(false.B)
@@ -311,6 +369,9 @@ class SRV32I extends Module {
           }.elsewhen(dec.isECALL) {
             ecallReg  := true.B
             haltedReg := true.B
+          }.elsewhen(dec.isEBREAK) {
+            ebreakReg := true.B
+            haltedReg := true.B
           }.elsewhen(dec.isStore) {
             io.dmem.wen := true.B
             pcReg := nextPCExec
@@ -318,7 +379,12 @@ class SRV32I extends Module {
           }.elsewhen(dec.isLoad) {
             state := sMem
           }.otherwise {
-            regWen := dec.isRType || dec.isIType || dec.isLUI || dec.isAUIPC || dec.isJAL || dec.isJALR
+            // Covers R-type/I-type ALU ops, LUI, AUIPC, JAL, JALR, branches,
+            // custom-0 ops, and FENCE (a NOP here -- no reordering/invalidation
+            // needed on this single-issue, non-caching core). Any new isCustom
+            // op added to CustomOp writes back through this same path.
+            regWen := dec.isRType || dec.isIType || dec.isLUI || dec.isAUIPC ||
+              dec.isJAL || dec.isJALR || dec.isCustom
             pcReg  := nextPCExec
             state  := sFetch
           }
@@ -342,6 +408,7 @@ class SRV32I extends Module {
     haltedReg  := false.B
     illegalReg := false.B
     ecallReg   := false.B
+    ebreakReg  := false.B
     cycleReg   := 0.U
     state      := sFetch
   }
@@ -353,4 +420,5 @@ class SRV32I extends Module {
   io.debugStatus.halted      := haltedReg
   io.debugStatus.illegalInst := illegalReg
   io.debugStatus.ecall       := ecallReg
+  io.debugStatus.ebreak      := ebreakReg
 }

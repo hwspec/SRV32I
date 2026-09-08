@@ -43,6 +43,21 @@ STAGE_ORDER = [
     "fpga",
 ]
 
+REQUIRED_STAGE_ORDER = [
+    "prereq",
+    "repo",
+    "bridge",
+    "rtlgen",
+    "cocotb",
+    "aved",
+    "useracc",
+    "firmware",
+    "program",
+    "fpga",
+]
+
+OPTIONAL_STAGES = {"fpgatiming"}
+
 
 def run(cmd, *, cwd=ROOT, env=None, ignore_returncode=False):
     print(f"\n[{cwd}] $ {' '.join(map(str, cmd))}")
@@ -131,16 +146,17 @@ def show_status():
 def next_runnable_stage():
     status = load_status()
 
-    for name in STAGE_ORDER:
+    for name in REQUIRED_STAGE_ORDER:
         if status.get(name) == "success":
             continue
 
         deps, _ = STAGES[name]
-        if all(status.get(dep) == "success" for dep in deps):
+        required_deps = [dep for dep in deps if dep not in OPTIONAL_STAGES]
+
+        if all(status.get(dep) == "success" for dep in required_deps):
             return name
 
     return None
-
 
 def show_next():
     name = next_runnable_stage()
@@ -722,49 +738,67 @@ def _run_stage_in_tmux(name):
 
 
 def run_named_stage(name):
-    """Run exactly one named stage; do not run its dependencies."""
+    """Run exactly one named stage; do not run dependencies."""
     if name in TMUX_STAGES:
         return _run_stage_in_tmux(name)
     return _run_direct_stage(name)
 
 
-def resume_workflow():
+def resume_workflow(start_stage=None):
     """
-    Continue the workflow from .gwstatus.
+    Continue the required workflow.
 
-    Successful stages are skipped. A pending/failed stage is run only when all
-    of its declared dependencies are marked success in .gwstatus.
+    If start_stage is specified, force-run that stage and every later required
+    stage, regardless of previous success markers. fpgatiming remains optional
+    and runs only when explicitly selected.
+
+    If start_stage is omitted, begin at the first unfinished runnable required
+    stage and continue forward, skipping stages already marked successful.
     """
-    ran_any = False
+    if start_stage == "fpgatiming":
+        run_named_stage("fpgatiming")
+        return
 
-    while True:
+    order = REQUIRED_STAGE_ORDER
+
+    if start_stage is not None:
+        if start_stage not in order:
+            raise RuntimeError(f"Unknown required resume stage: {start_stage}")
+
+        start_index = order.index(start_stage)
+
+        for name in order[start_index:]:
+            print(f"\nResuming stage: {name}")
+            run_named_stage(name)
+
+        return
+
+    first = next_runnable_stage()
+    if first is None:
+        print("All required stages are complete.")
+        return
+
+    start_index = order.index(first)
+
+    for name in order[start_index:]:
         status = load_status()
 
-        unfinished = [
-            name for name in STAGE_ORDER
-            if status.get(name) != "success"
-        ]
+        if status.get(name) == "success":
+            continue
 
-        if not unfinished:
-            print("All stages are complete.")
-            return
+        deps, _ = STAGES[name]
+        required_deps = [dep for dep in deps if dep not in OPTIONAL_STAGES]
 
-        runnable = None
+        missing = [dep for dep in required_deps if status.get(dep) != "success"]
+        if missing:
+            raise RuntimeError(
+                f"Cannot resume {name}: dependencies not successful: "
+                + ", ".join(missing)
+            )
 
-        for name in unfinished:
-            deps, _ = STAGES[name]
-            if all(status.get(dep) == "success" for dep in deps):
-                runnable = name
-                break
+        print(f"\nResuming stage: {name}")
+        run_named_stage(name)
 
-        if runnable is None:
-            print("No unfinished stage is currently runnable.")
-            print("Check .gwstatus and dependency states.")
-            return
-
-        print(f"\nResuming stage: {runnable}")
-        run_named_stage(runnable)
-        ran_any = True
 
 def print_timing_summary(total_elapsed):
     if not stage_times:
@@ -800,8 +834,14 @@ def main():
 
     parser.add_argument(
         "--resume",
-        action="store_true",
-        help="Continue unfinished stages using .gwstatus",
+        nargs="?",
+        const="__auto__",
+        choices=["__auto__"] + list(STAGES.keys()),
+        metavar="STAGE",
+        help=(
+            "Resume required workflow from STAGE, or from the first unfinished "
+            "required stage when STAGE is omitted"
+        ),
     )
 
     parser.add_argument(
@@ -849,13 +889,13 @@ def main():
     total_start = time.monotonic()
 
     try:
-        if args.resume:
+        if args.resume is not None:
             if args.stage is not None:
-                print(
-                    "WARNING: stage argument is ignored with --resume; "
-                    "resuming from .gwstatus"
+                raise RuntimeError(
+                    "Use either '--resume [STAGE]' or a positional stage, not both"
                 )
-            resume_workflow()
+            start_stage = None if args.resume == "__auto__" else args.resume
+            resume_workflow(start_stage)
         else:
             stage = args.stage or "fpga"
             run_named_stage(stage)

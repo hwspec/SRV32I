@@ -14,7 +14,7 @@ EXTRA_ARGS += --trace --trace-structs
 
 test : $(SRCDIR)/$(HWMODULENAME).sv
 	@echo $(VERILOG_SOURCES)
-	@PARAMFN=$(SRCDIR)/SRV32I_params.json $(MAKE) sim MODULE=tb_axisrv32i TOPLEVEL=$(TOPNAME)
+	@PARAMFN=$(SRCDIR)/params.json $(MAKE) sim MODULE=tb_axisrv32i TOPLEVEL=$(TOPNAME)
 	@echo -e "\n[Output]"
 	@cat output.log
 

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,24 +18,49 @@ AVED_HW = AVED / "hw/amd_v80_gen5x8_25.1"
 USER_ACCEL = AVED_HW / "src/rtl/user_accel"
 GENERATED = ROOT / "generated/AxiSRV32I"
 VENV = ROOT / "chisel-axi-utils/.venv"
-STATE_FILE = ROOT / ".build-state.json"
+
+STATUS_FILE = ROOT / ".gwstatus"
+RESULTS_FILE = ROOT / ".gwstage-results.json"
+LOG_DIR = ROOT / ".gwlogs"
 
 completed = set()
+stage_results = {}
+stage_times = {}
+
+TMUX_STAGES = {"fpgatiming", "firmware"}
+
+STAGE_ORDER = [
+    "prereq",
+    "repo",
+    "bridge",
+    "rtlgen",
+    "cocotb",
+    "fpgatiming",
+    "aved",
+    "useracc",
+    "firmware",
+    "program",
+    "fpga",
+]
 
 
-def run(cmd, *, cwd=ROOT, env=None):
-    """Run command and fail immediately on non-zero exit status."""
+def run(cmd, *, cwd=ROOT, env=None, ignore_returncode=False):
     print(f"\n[{cwd}] $ {' '.join(map(str, cmd))}")
-    subprocess.run(
-        cmd,
-        cwd=cwd,
-        env=env,
-        check=True,
-    )
+    result = subprocess.run(cmd, cwd=cwd, env=env, check=False)
+
+    if result.returncode != 0:
+        if ignore_returncode:
+            print(
+                f"WARNING: ignoring exit code {result.returncode}: "
+                f"{' '.join(map(str, cmd))}"
+            )
+        else:
+            raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    return result
 
 
 def capture(cmd, *, cwd=ROOT):
-    """Run command, check exit status, and return stdout."""
     result = subprocess.run(
         cmd,
         cwd=cwd,
@@ -47,55 +73,161 @@ def capture(cmd, *, cwd=ROOT):
 
 
 def venv_env():
-    """Return an environment equivalent to activating the project venv."""
     env = os.environ.copy()
     env["VIRTUAL_ENV"] = str(VENV)
     env["PATH"] = f"{VENV / 'bin'}:{env['PATH']}"
     return env
 
 
-def load_state():
-    if not STATE_FILE.exists():
+def default_status():
+    return {name: "pending" for name in STAGE_ORDER}
+
+
+def load_status():
+    status = default_status()
+
+    if not STATUS_FILE.exists():
+        return status
+
+    for raw in STATUS_FILE.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip().lower()
+
+        if name in status:
+            status[name] = value
+
+    return status
+
+
+def save_status(status):
+    lines = [
+        "# GarageWork build status",
+        "# Values: pending, running, success, failed",
+        "# This file is intentionally editable by hand.",
+        "",
+    ]
+    for name in STAGE_ORDER:
+        lines.append(f"{name}={status.get(name, 'pending')}")
+    STATUS_FILE.write_text("\n".join(lines) + "\n")
+
+
+def set_stage_status(name, value):
+    status = load_status()
+    status[name] = value
+    save_status(status)
+
+
+def show_status():
+    status = load_status()
+    for name in STAGE_ORDER:
+        print(f"{name:12s} {status[name]}")
+
+
+def next_runnable_stage():
+    status = load_status()
+
+    for name in STAGE_ORDER:
+        if status.get(name) == "success":
+            continue
+
+        deps, _ = STAGES[name]
+        if all(status.get(dep) == "success" for dep in deps):
+            return name
+
+    return None
+
+
+def show_next():
+    name = next_runnable_stage()
+
+    if name is None:
+        print("No pending runnable stage.")
+        return
+
+    deps, _ = STAGES[name]
+    print(f"Next runnable stage: {name}")
+
+    if deps:
+        status = load_status()
+        print(
+            "Depends on: " +
+            ", ".join(f"{dep} [{status.get(dep, 'pending')}]" for dep in deps)
+        )
+    else:
+        print("Depends on: none")
+
+
+def load_stage_results():
+    if not RESULTS_FILE.exists():
         return {}
 
     try:
-        return json.loads(STATE_FILE.read_text())
+        return json.loads(RESULTS_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
 
 
-def save_stage_success(stage, detail=None):
-    state = {
-        "last_successful_stage": stage,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+def save_stage_results(data):
+    RESULTS_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def record_stage_success(name, result, elapsed_sec):
+    data = load_stage_results()
+    entry = data.setdefault(name, {})
+    now = datetime.now().isoformat(timespec="seconds")
+
+    entry["last_attempt"] = {
+        "timestamp": now,
+        "success": True,
+        "elapsed_sec": elapsed_sec,
+    }
+    entry["last_success"] = {
+        "timestamp": now,
+        "elapsed_sec": elapsed_sec,
+        "result": result,
     }
 
-    if detail:
-        state["detail"] = str(detail)
-
-    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+    save_stage_results(data)
 
 
-def show_status():
-    state = load_state()
+def record_stage_failure(name, elapsed_sec, message):
+    data = load_stage_results()
+    entry = data.setdefault(name, {})
 
-    stage = state.get("last_successful_stage")
-    if not stage:
-        print("No successful stage recorded.")
-        return
+    entry["last_attempt"] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "success": False,
+        "elapsed_sec": elapsed_sec,
+        "error": message,
+    }
 
-    print(f"Last successful stage: {stage}")
-
-    if "timestamp" in state:
-        print(f"Time: {state['timestamp']}")
-
-    if "detail" in state:
-        print(f"Detailed output: {state['detail']}")
+    save_stage_results(data)
 
 
-# ----------------------------------------------------------------------
-# Stages
-# ----------------------------------------------------------------------
+def get_stage_info(name):
+    return load_stage_results().get(name)
+
+
+def get_stage_result(name):
+    info = get_stage_info(name)
+    if not info:
+        return None
+
+    last_success = info.get("last_success")
+    if not last_success:
+        return None
+
+    return last_success.get("result")
+
+
+def stage_succeeded(name):
+    return get_stage_result(name) is not None
+
 
 def prereq():
     verilator = capture(["verilator", "--version"])
@@ -111,10 +243,11 @@ def prereq():
     if not gcc.startswith("12."):
         print("WARNING: GCC 12.* is recommended.")
 
+    return {"verilator": verilator, "gcc": gcc}
+
 
 def repo():
     status = capture(["git", "submodule", "status"])
-
     uninitialized = any(
         line.startswith("-")
         for line in status.splitlines()
@@ -126,9 +259,12 @@ def repo():
     else:
         print("Git submodules already initialized.")
 
+    return {"initialized": True}
+
 
 def bridge():
     run(["make", "-C", "chisel-axi-utils", "setup"])
+    return {"venv": str(VENV)}
 
 
 def rtlgen():
@@ -139,12 +275,191 @@ def rtlgen():
             f"RTL generation succeeded but {GENERATED} does not exist"
         )
 
+    return {"generated_dir": str(GENERATED)}
+
 
 def cocotb():
-    run(
-        ["make", "-C", "tests"],
-        env=venv_env(),
+    run(["make", "-C", "tests"], env=venv_env())
+    return {"tests_dir": str(ROOT / "tests")}
+
+
+def _set_xdc_period(xdc_path, period_ns):
+    text = xdc_path.read_text()
+
+    pattern = re.compile(
+        r"(create_clock\b[^\n]*?-period\s+)([0-9]*\.?[0-9]+)",
+        re.IGNORECASE,
     )
+
+    new_text, count = pattern.subn(
+        lambda m: f"{m.group(1)}{period_ns:.4f}",
+        text,
+        count=1,
+    )
+
+    if count != 1:
+        raise RuntimeError(
+            f"Could not uniquely update create_clock -period in {xdc_path}"
+        )
+
+    xdc_path.write_text(new_text)
+
+
+def _find_timing_report(workdir):
+    candidates = list(workdir.rglob("*timing*.rpt"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _parse_wns_from_text(text):
+    patterns = [
+        r"\bWNS(?:\(ns\))?\s*[:=]?\s*(-?\d+(?:\.\d+)?)",
+        r"\bWNS\s+TNS\b.*?\n\s*(-?\d+(?:\.\d+)?)",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+        if m:
+            return float(m.group(1))
+
+    return None
+
+
+def _run_timing_trial(period_ns):
+    workdir = GENERATED
+    xdc = workdir / "constraints.xdc"
+
+    if not xdc.exists():
+        raise RuntimeError(f"Missing XDC file: {xdc}")
+
+    _set_xdc_period(xdc, period_ns)
+
+    LOG_DIR.mkdir(exist_ok=True)
+    safe = str(period_ns).replace(".", "p")
+    log_path = LOG_DIR / f"fpgatiming-{safe}ns.log"
+
+    print(f"\nTrying FPGA period {period_ns:.4f} ns")
+    print(f"Log: {log_path}")
+
+    with log_path.open("w") as logfile:
+        proc = subprocess.Popen(
+            ["./compile.sh"],
+            cwd=workdir,
+            env=os.environ.copy(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        assert proc.stdout is not None
+        output_lines = []
+
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            logfile.write(line)
+            output_lines.append(line)
+
+        rc = proc.wait()
+
+    output = "".join(output_lines)
+
+    report = _find_timing_report(workdir)
+    report_text = report.read_text(errors="replace") if report else ""
+
+    wns = _parse_wns_from_text(report_text) if report_text else None
+    if wns is None:
+        wns = _parse_wns_from_text(output)
+
+    compile_ok = (rc == 0)
+    timing_ok = compile_ok and (wns is not None) and (wns >= 0.0)
+
+    return {
+        "period_ns": period_ns,
+        "compile_returncode": rc,
+        "wns_ns": wns,
+        "timing_ok": timing_ok,
+        "report": str(report) if report else None,
+        "log": str(log_path),
+    }
+
+
+def fpgatiming(start_period=2.0, max_period=10.0, resolution=0.05):
+    coarse_periods = [2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0]
+    coarse_periods = [p for p in coarse_periods if p >= start_period]
+
+    if start_period not in coarse_periods:
+        coarse_periods.insert(0, start_period)
+
+    trials = []
+    last_fail = None
+    first_pass = None
+
+    for period in coarse_periods:
+        if period > max_period:
+            break
+
+        trial = _run_timing_trial(period)
+        trials.append(trial)
+
+        state = "PASS" if trial["timing_ok"] else "FAIL"
+        print(
+            f"Timing {state}: period={period:.4f} ns "
+            f"WNS={trial['wns_ns']}"
+        )
+
+        if trial["timing_ok"]:
+            first_pass = period
+            break
+
+        last_fail = period
+
+    if first_pass is None:
+        raise RuntimeError(
+            f"No passing FPGA timing found through {max_period:.3f} ns"
+        )
+
+    best_period = first_pass
+    best_trial = trials[-1]
+
+    if last_fail is not None:
+        low = last_fail
+        high = first_pass
+
+        while (high - low) > resolution:
+            mid = (low + high) / 2.0
+            trial = _run_timing_trial(mid)
+            trials.append(trial)
+
+            state = "PASS" if trial["timing_ok"] else "FAIL"
+            print(
+                f"Timing {state}: period={mid:.4f} ns "
+                f"WNS={trial['wns_ns']}"
+            )
+
+            if trial["timing_ok"]:
+                high = mid
+                best_period = mid
+                best_trial = trial
+            else:
+                low = mid
+
+    result = {
+        "period_ns": best_period,
+        "frequency_mhz": 1000.0 / best_period,
+        "wns_ns": best_trial["wns_ns"],
+        "report": best_trial["report"],
+        "log": best_trial["log"],
+        "resolution_ns": resolution,
+        "trials": trials,
+    }
+
+    print(
+        f"\nLowest passing period: {best_period:.4f} ns "
+        f"({result['frequency_mhz']:.2f} MHz)"
+    )
+
+    return result
 
 
 def aved():
@@ -168,6 +483,11 @@ def aved():
     os.environ["AVED"] = str(AVED)
     print(f"AVED={AVED}")
 
+    run(["make", "-C", "sw/AMI/api"], cwd=AVED)
+    run(["make", "-C", "sw/runtime"], cwd=AVED)
+
+    return {"aved_dir": str(AVED)}
+
 
 def useracc():
     USER_ACCEL.mkdir(parents=True, exist_ok=True)
@@ -179,10 +499,15 @@ def useracc():
     if not files:
         raise RuntimeError(f"No generated RTL/JSON files found in {GENERATED}")
 
+    copied = []
+
     for src in files:
         dst = USER_ACCEL / src.name
         print(f"copy {src} -> {dst}")
         shutil.copy2(src, dst)
+        copied.append(str(dst))
+
+    return {"copied": copied}
 
 
 def firmware():
@@ -213,11 +538,15 @@ def firmware():
         raise subprocess.CalledProcessError(rc, ["./build_all.sh"])
 
     print("Firmware compilation completed successfully.")
-    return log_path
+    return {"log": str(log_path)}
 
 
 def program():
-    run(["make", "prog"], cwd=AVED)
+    prog_result = run(
+        ["make", "prog"],
+        cwd=AVED,
+        ignore_returncode=True,
+    )
 
     run([
         "sudo",
@@ -226,6 +555,11 @@ def program():
         "-t", "sbr",
         "-d", "b1:00.0",
     ])
+
+    return {
+        "make_prog_returncode": prog_result.returncode,
+        "ami_reload": "success",
+    }
 
 
 def fpga():
@@ -245,7 +579,7 @@ def fpga():
     )
 
     env["PARAMFN"] = str(
-        AVED_HW / "src/rtl/user_accel/Recode2_params.json"
+        AVED_HW / "src/rtl/user_accel/SRV32I_params.json"
     )
 
     run(
@@ -266,44 +600,187 @@ def fpga():
     for line in lines[-30:]:
         print(line)
 
-    return output_log
+    return {"output_log": str(output_log)}
 
-
-# ----------------------------------------------------------------------
-# Dependency graph
-# ----------------------------------------------------------------------
 
 STAGES = {
-    "prereq":   ([], prereq),
-    "repo":     (["prereq"], repo),
-    "bridge":   (["repo"], bridge),
-    "rtlgen":   (["repo"], rtlgen),
-    "cocotb":   (["rtlgen", "bridge"], cocotb),
-    "aved":     (["prereq"], aved),
-    "useracc":  (["rtlgen", "aved"], useracc),
-    "firmware": (["useracc"], firmware),
-    "program":  (["firmware"], program),
-    "fpga":     (["program"], fpga),
+    "prereq":     ([], prereq),
+    "repo":       (["prereq"], repo),
+    "bridge":     (["repo"], bridge),
+    "rtlgen":     (["repo"], rtlgen),
+    "cocotb":     (["rtlgen", "bridge"], cocotb),
+    "fpgatiming": (["rtlgen"], fpgatiming),
+    "aved":       (["prereq"], aved),
+    "useracc":    (["rtlgen", "aved"], useracc),
+    "firmware":   (["useracc"], firmware),
+    "program":    (["firmware"], program),
+    "fpga":       (["program"], fpga),
 }
 
 
-def execute_stage(name):
-    if name in completed:
-        return
+def _latest_attempt_succeeded(name):
+    info = get_stage_info(name)
+    if not info:
+        return False
 
-    dependencies, func = STAGES[name]
+    last_attempt = info.get("last_attempt")
+    return bool(last_attempt and last_attempt.get("success"))
 
-    for dep in dependencies:
-        execute_stage(dep)
+
+def _run_direct_stage(name):
+    _, func = STAGES[name]
 
     print()
     print("=" * 72)
     print(f"STAGE: {name}")
     print("=" * 72)
 
-    detail = func()
-    save_stage_success(name, detail)
-    completed.add(name)
+    set_stage_status(name, "running")
+    start = time.monotonic()
+
+    try:
+        result = func()
+        elapsed = time.monotonic() - start
+
+        stage_results[name] = result
+        stage_times[name] = elapsed
+
+        record_stage_success(name, result, elapsed)
+        set_stage_status(name, "success")
+        return result
+
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        stage_times[name] = elapsed
+
+        record_stage_failure(name, elapsed, str(e))
+        set_stage_status(name, "failed")
+        raise
+
+
+def _run_stage_in_tmux(name):
+    import shlex
+
+    LOG_DIR.mkdir(exist_ok=True)
+
+    session = f"gw-{name}"
+    log_path = LOG_DIR / f"{name}.log"
+    script = Path(__file__).resolve()
+
+    existing = subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if existing.returncode == 0:
+        raise RuntimeError(f"tmux session already exists: {session}")
+
+    cmd = (
+        f"{shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(script))} "
+        f"--direct-stage {shlex.quote(name)} "
+        f"2>&1 | tee {shlex.quote(str(log_path))}"
+    )
+
+    run([
+        "tmux",
+        "new-session",
+        "-d",
+        "-s", session,
+        cmd,
+    ])
+
+    print(f"{name}: running in tmux session '{session}'")
+    print(f"log: {log_path}")
+
+    while True:
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", session],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        if result.returncode != 0:
+            break
+
+        time.sleep(2)
+
+    if not _latest_attempt_succeeded(name):
+        raise RuntimeError(f"{name} failed; see {log_path}")
+
+    result = get_stage_result(name)
+    stage_results[name] = result
+
+    info = get_stage_info(name) or {}
+    last_success = info.get("last_success", {})
+
+    if "elapsed_sec" in last_success:
+        stage_times[name] = last_success["elapsed_sec"]
+
+    return result
+
+
+def run_named_stage(name):
+    """Run exactly one named stage; do not run its dependencies."""
+    if name in TMUX_STAGES:
+        return _run_stage_in_tmux(name)
+    return _run_direct_stage(name)
+
+
+def resume_workflow():
+    """
+    Continue the workflow from .gwstatus.
+
+    Successful stages are skipped. A pending/failed stage is run only when all
+    of its declared dependencies are marked success in .gwstatus.
+    """
+    ran_any = False
+
+    while True:
+        status = load_status()
+
+        unfinished = [
+            name for name in STAGE_ORDER
+            if status.get(name) != "success"
+        ]
+
+        if not unfinished:
+            print("All stages are complete.")
+            return
+
+        runnable = None
+
+        for name in unfinished:
+            deps, _ = STAGES[name]
+            if all(status.get(dep) == "success" for dep in deps):
+                runnable = name
+                break
+
+        if runnable is None:
+            print("No unfinished stage is currently runnable.")
+            print("Check .gwstatus and dependency states.")
+            return
+
+        print(f"\nResuming stage: {runnable}")
+        run_named_stage(runnable)
+        ran_any = True
+
+def print_timing_summary(total_elapsed):
+    if not stage_times:
+        return
+
+    print()
+    print("=" * 72)
+    print("STAGE TIMING")
+    print("=" * 72)
+
+    for name in STAGE_ORDER:
+        if name in stage_times:
+            print(f"{name:12s} {stage_times[name]:10.1f} s")
+
+    print("-" * 24)
+    print(f"{'Total':12s} {total_elapsed:10.1f} s")
 
 
 def main():
@@ -312,7 +789,25 @@ def main():
     parser.add_argument(
         "--status",
         action="store_true",
-        help="Show the last successfully completed stage",
+        help="Show editable stage status",
+    )
+
+    parser.add_argument(
+        "--next",
+        action="store_true",
+        help="Show the next runnable stage",
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue unfinished stages using .gwstatus",
+    )
+
+    parser.add_argument(
+        "--direct-stage",
+        choices=STAGES.keys(),
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -325,25 +820,63 @@ def main():
 
     args = parser.parse_args()
 
+    if not STATUS_FILE.exists():
+        save_status(default_status())
+
     if args.status:
         show_status()
         return
 
-    stage = args.stage or "fpga"
+    if args.next:
+        show_next()
+        return
+
+    if args.direct_stage:
+        try:
+            _run_direct_stage(args.direct_stage)
+        except subprocess.CalledProcessError as e:
+            print(
+                f"\nERROR: command failed with exit code {e.returncode}",
+                file=sys.stderr,
+            )
+            sys.exit(e.returncode or 1)
+        except Exception as e:
+            print(f"\nERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
 
     print(f"Project root: {ROOT}")
+    total_start = time.monotonic()
 
     try:
-        execute_stage(stage)
+        if args.resume:
+            if args.stage is not None:
+                print(
+                    "WARNING: stage argument is ignored with --resume; "
+                    "resuming from .gwstatus"
+                )
+            resume_workflow()
+        else:
+            stage = args.stage or "fpga"
+            run_named_stage(stage)
     except subprocess.CalledProcessError as e:
+        total_elapsed = time.monotonic() - total_start
+        print_timing_summary(total_elapsed)
+
         print(
             f"\nERROR: command failed with exit code {e.returncode}",
             file=sys.stderr,
         )
         sys.exit(e.returncode or 1)
     except Exception as e:
+        total_elapsed = time.monotonic() - total_start
+        print_timing_summary(total_elapsed)
+
         print(f"\nERROR: {e}", file=sys.stderr)
         sys.exit(1)
+
+    total_elapsed = time.monotonic() - total_start
+    print_timing_summary(total_elapsed)
 
 
 if __name__ == "__main__":

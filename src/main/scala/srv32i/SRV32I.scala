@@ -175,7 +175,8 @@ object MemAccess {
 //      SH/MB/ME fields), extend DecodedInst/Decoder with a dedicated custom
 //      immediate rather than overloading immI/immS/etc.
 // No other file needs to change: SRV32I wires isCustom into regWen/wbData
-// generically, so any op added here writes back automatically.
+// generically, so any op added here writes back automatically, and the same
+// rs1/rs2/rd fields already participate in the pipeline's hazard checks.
 object CustomOp {
   val RLWIMI = 0.U(3.W) // funct3 = 000: rotate-left rs1 by shamt, insert into rd under mask
 
@@ -184,7 +185,7 @@ object CustomOp {
       // TODO: real rlwimi semantics -- result = (rotl(rs1Data, shamt) & mask) | (rdData & ~mask).
       // shamt/mask need a dedicated immediate field (PPC packs SH/MB/ME in 15 bits,
       // which doesn't fit funct7's 7 bits); stubbed as passthrough of rd until that
-      // encoding is defined, so the datapath/FSM plumbing below is exercised as-is.
+      // encoding is defined, so the datapath/hazard plumbing below is exercised as-is.
       RLWIMI -> rdData
     ))
   }
@@ -203,9 +204,20 @@ class RegFile extends Module {
     val rdAddr = Input(UInt(5.W))
     val rdData = Output(UInt(32.W))
 
+    // Primary write port: the instruction currently completing in EX.
     val wen   = Input(Bool())
     val waddr = Input(UInt(5.W))
     val wdata = Input(UInt(32.W))
+
+    // Second write port: a load's result, which lands one cycle after the
+    // load itself was in EX (dmem's registered-read latency) -- see
+    // loadPendReg in SRV32I. A plain 32-entry regfile with combinational
+    // reads supports a second write port cheaply; this keeps the pipeline
+    // free of a write-port arbiter/stall for the (common) case where the
+    // instruction after a load doesn't depend on it.
+    val wenLoad   = Input(Bool())
+    val waddrLoad = Input(UInt(5.W))
+    val wdataLoad = Input(UInt(32.W))
 
     val debugRegs = Output(Vec(32, UInt(32.W)))
   })
@@ -216,6 +228,9 @@ class RegFile extends Module {
   io.rs2Data := Mux(io.rs2Addr === 0.U, 0.U, regs.read(io.rs2Addr))
   io.rdData  := Mux(io.rdAddr === 0.U, 0.U, regs.read(io.rdAddr))
 
+  when(io.wenLoad && io.waddrLoad =/= 0.U) {
+    regs.write(io.waddrLoad, io.wdataLoad)
+  }
   when(io.wen && io.waddr =/= 0.U) {
     regs.write(io.waddr, io.wdata)
   }
@@ -225,6 +240,31 @@ class RegFile extends Module {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 2-stage (IF / EX) pipeline.
+//
+// There's no explicit instruction latch between fetch and execute: imem is a
+// 1-cycle-latency synchronous-read memory, so its own registered output IS
+// the IF/EX pipeline register. pcFetchReg is "the address applied to imem
+// this cycle"; pcExReg mirrors pcFetchReg one cycle later, i.e. it labels
+// whichever instruction io.imem.inst is currently showing.
+//
+// Because the regfile write commits synchronously while reads are
+// combinational, a normal producer->consumer pair (instruction i writes,
+// instruction i+1 reads) needs NO forwarding: by the time i+1 reaches EX and
+// reads the regfile, i's write already landed. The two cases that don't fall
+// out for free:
+//   - taken branch/JAL/JALR: the next instruction was already speculatively
+//     fetched under a not-taken/PC+4 assumption and must be squashed
+//     (bubbleReg) -- 1-cycle penalty.
+//   - load-use: dmem also has 1-cycle read latency, so a load's result isn't
+//     available until one cycle *after* it's in EX -- one cycle later than a
+//     normal ALU op. loadPendReg carries that result into the following
+//     cycle's regfile write; if the very next instruction actually reads (or
+//     writes) that same register, `stall` re-issues it for one extra cycle.
+// Everything else -- ALU ops, not-taken branches, stores, custom-0 ops,
+// FENCE -- is 1 cycle per instruction.
+// ---------------------------------------------------------------------------
 class SRV32I extends Module {
   val io = IO(new Bundle {
     val enable       = Input(Bool())
@@ -257,29 +297,45 @@ class SRV32I extends Module {
     })
   })
 
-  // ---------------- FSM state ----------------
-  // pc only changes when returning to sFetch, so the address presented to
-  // imem/dmem is stable across sExec/sMem -- matches fixed-1-cycle SyncReadMem
-  // latency with no handshake: address issued one state, data valid the next.
-  val sFetch :: sExec :: sMem :: Nil = Enum(3)
-  val state = RegInit(sFetch)
+  // ---------------- Pipeline registers ----------------
+  val pcFetchReg = RegInit(0.U(32.W)) // address applied to imem this cycle
+  val pcExReg    = RegInit(0.U(32.W)) // PC of the instruction currently in EX
+  val bubbleReg  = RegInit(true.B)    // true: EX holds no valid instruction (warmup/squashed)
 
-  val pcReg      = RegInit(0.U(32.W))
   val haltedReg  = RegInit(false.B)
   val illegalReg = RegInit(false.B)
   val ecallReg   = RegInit(false.B)
   val ebreakReg  = RegInit(false.B)
   val cycleReg   = RegInit(0.U(64.W))
 
+  // Outstanding load: set when a load completes EX; consumed one cycle later
+  // to (a) write its result and (b) let the hazard check see it.
+  val loadPendReg     = RegInit(false.B)
+  val loadPendRdReg   = Reg(UInt(5.W))
+  val loadPendF3Reg   = Reg(UInt(3.W))
+
   val active = io.enable && !haltedReg
   io.running := active
 
   // ---------------- Instruction fetch ----------------
-  io.imem.addr := pcReg
+  io.imem.addr := pcFetchReg
 
   val decoder = Module(new Decoder)
   decoder.io.inst := io.imem.inst
   val dec = decoder.io.out
+
+  // ---------------- Hazard check ----------------
+  // Only case that needs a stall: the instruction now in EX reads (or would
+  // clobber, via the second write port) the register a pending load is about
+  // to write. Loads two or more instructions apart never trigger this, since
+  // the write always lands exactly one cycle after the load leaves EX.
+  val writesRd = dec.isRType || dec.isIType || dec.isLUI || dec.isAUIPC ||
+    dec.isJAL || dec.isJALR || dec.isCustom
+  val stall = !bubbleReg && loadPendReg && loadPendRdReg =/= 0.U &&
+    (dec.rs1 === loadPendRdReg || dec.rs2 === loadPendRdReg ||
+      ((writesRd || dec.isLoad) && dec.rd === loadPendRdReg))
+
+  val instrValid = !bubbleReg && !stall
 
   // ---------------- Register file ----------------
   val regFile = Module(new RegFile)
@@ -325,16 +381,20 @@ class SRV32I extends Module {
   val memAddr = rs1Data +% Mux(dec.isStore, dec.immS, dec.immI)
   io.dmem.addr  := memAddr
   io.dmem.wdata := rs2Data
-  io.dmem.wen   := false.B // set true only in sExec for stores
+  io.dmem.wen   := instrValid && dec.isStore
   io.dmem.wmask := MemAccess.storeMask(dec.funct3)
 
   // ---------------- Next PC / writeback values ----------------
-  val pcPlus4      = pcReg +% 4.U(32.W)
-  val branchTarget = pcReg +% dec.immB
-  val jalTarget    = pcReg +% dec.immJ
+  val pcPlus4      = pcExReg +% 4.U(32.W)
+  val branchTarget = pcExReg +% dec.immB
+  val jalTarget    = pcExReg +% dec.immJ
   val jalrTarget   = (rs1Data +% dec.immI) & ~1.U(32.W)
 
-  val nextPCExec = MuxCase(pcPlus4, Seq(
+  // A flush only fires for a real, completing (non-bubble, non-stalled)
+  // taken branch/jump -- the instruction already fetched under the
+  // not-taken/PC+4 prediction is what gets squashed via bubbleReg below.
+  val flushRedirect = instrValid && ((dec.isBranch && branchTaken) || dec.isJAL || dec.isJALR)
+  val redirectTarget = MuxCase(pcPlus4, Seq(
     (dec.isBranch && branchTaken) -> branchTarget,
     dec.isJAL  -> jalTarget,
     dec.isJALR -> jalrTarget
@@ -342,79 +402,67 @@ class SRV32I extends Module {
 
   val wbData = MuxCase(aluOut, Seq(
     dec.isLUI   -> dec.immU,
-    dec.isAUIPC -> (pcReg +% dec.immU),
+    dec.isAUIPC -> (pcExReg +% dec.immU),
     (dec.isJAL || dec.isJALR) -> pcPlus4,
     dec.isCustom -> customOut
   ))
 
-  val regWen   = WireDefault(false.B)
-  val regWdata = WireDefault(wbData)
+  val regWen = instrValid && writesRd
   regFile.io.wen   := regWen
   regFile.io.waddr := dec.rd
-  regFile.io.wdata := regWdata
+  regFile.io.wdata := wbData
 
-  // ---------------- Control ----------------
+  regFile.io.wenLoad   := loadPendReg
+  regFile.io.waddrLoad := loadPendRdReg
+  regFile.io.wdataLoad := MemAccess.loadData(loadPendF3Reg, io.dmem.rdata)
+
+  // ---------------- Pipeline advance ----------------
   when(io.enable) {
     when(!haltedReg) {
       cycleReg := cycleReg + 1.U
 
-      switch(state) {
-        is(sFetch) {
-          state := sExec
-        }
-        is(sExec) {
-          when(dec.illegal) {
-            illegalReg := true.B
-            haltedReg  := true.B
-          }.elsewhen(dec.isECALL) {
-            ecallReg  := true.B
-            haltedReg := true.B
-          }.elsewhen(dec.isEBREAK) {
-            ebreakReg := true.B
-            haltedReg := true.B
-          }.elsewhen(dec.isStore) {
-            io.dmem.wen := true.B
-            pcReg := nextPCExec
-            state := sFetch
-          }.elsewhen(dec.isLoad) {
-            state := sMem
-          }.otherwise {
-            // Covers R-type/I-type ALU ops, LUI, AUIPC, JAL, JALR, branches,
-            // custom-0 ops, and FENCE (a NOP here -- no reordering/invalidation
-            // needed on this single-issue, non-caching core). Any new isCustom
-            // op added to CustomOp writes back through this same path.
-            regWen := dec.isRType || dec.isIType || dec.isLUI || dec.isAUIPC ||
-              dec.isJAL || dec.isJALR || dec.isCustom
-            pcReg  := nextPCExec
-            state  := sFetch
-          }
-        }
-        is(sMem) {
-          regWen   := true.B
-          regWdata := MemAccess.loadData(dec.funct3, io.dmem.rdata)
-          pcReg    := nextPCExec // == pcPlus4 for loads
-          state    := sFetch
-        }
+      // pcExReg always mirrors pcFetchReg one cycle later -- what changes is
+      // what we point pcFetchReg at:
+      //   stall -> re-issue the current (stalled) instruction's own address,
+      //            so it's the one that shows up again next cycle
+      //   flush -> jump to the resolved branch/jump target
+      //   else  -> keep fetching straight-line (PC+4)
+      pcFetchReg := Mux(stall, pcExReg,
+        Mux(flushRedirect, redirectTarget, pcFetchReg +% 4.U))
+      pcExReg   := pcFetchReg
+      bubbleReg := flushRedirect // next cycle's instruction is a bubble iff this cycle flushed
+
+      loadPendReg   := instrValid && dec.isLoad
+      loadPendRdReg := dec.rd
+      loadPendF3Reg := dec.funct3
+
+      when(instrValid) {
+        when(dec.illegal)      { illegalReg := true.B; haltedReg := true.B }
+          .elsewhen(dec.isECALL)  { ecallReg  := true.B; haltedReg := true.B }
+          .elsewhen(dec.isEBREAK) { ebreakReg := true.B; haltedReg := true.B }
       }
     }
   }.otherwise {
-    when(io.entryAddr_we) { pcReg := io.entryAddr }
-    state := sFetch
+    when(io.entryAddr_we) { pcFetchReg := io.entryAddr }
+    bubbleReg     := true.B
+    loadPendReg   := false.B
   }
 
   // ---------------- Soft reset (overrides above) ----------------
   when(io.softReset) {
-    pcReg      := 0.U
-    haltedReg  := false.B
-    illegalReg := false.B
-    ecallReg   := false.B
-    ebreakReg  := false.B
-    cycleReg   := 0.U
-    state      := sFetch
+    pcFetchReg  := 0.U
+    pcExReg     := 0.U
+    bubbleReg   := true.B
+    loadPendReg := false.B
+    haltedReg   := false.B
+    illegalReg  := false.B
+    ecallReg    := false.B
+    ebreakReg   := false.B
+    cycleReg    := 0.U
   }
 
   // ---------------- Debug ----------------
-  io.debugPC     := pcReg
+  io.debugPC     := pcExReg
   io.debugCycles := cycleReg
   io.debugStatus.running     := io.running
   io.debugStatus.halted      := haltedReg

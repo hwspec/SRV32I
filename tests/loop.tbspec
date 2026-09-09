@@ -1,0 +1,6 @@
+input program is like below
+total = 0
+for (i = 0 ; i < 100 ; i++) total += i
+save total into one of regs
+
+check the total number

@@ -12,9 +12,14 @@ VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
 WAVES = 1
 EXTRA_ARGS += --trace --trace-structs
 
-test : $(SRCDIR)/$(HWMODULENAME).sv
+TARGETS=basic loop
+
+all:
+	make basic
+
+$(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
 	@echo $(VERILOG_SOURCES)
-	@PARAMFN=$(SRCDIR)/params.json $(MAKE) sim MODULE=tb_axisrv32i TOPLEVEL=$(TOPNAME)
+	@PARAMFN=$(SRCDIR)/params.json $(MAKE) sim MODULE=tb_$@ TOPLEVEL=$(TOPNAME)
 	@echo -e "\n[Output]"
 	@cat output.log
 

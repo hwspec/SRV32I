@@ -12,7 +12,7 @@ VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
 WAVES = 1
 EXTRA_ARGS += --trace --trace-structs
 
-TARGETS=basic loop rlwimieq
+TARGETS=basic loop rlwimieq rlwimi
 
 all:
 	make basic

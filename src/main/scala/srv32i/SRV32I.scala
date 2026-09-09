@@ -68,6 +68,13 @@ class DecodedInst extends Bundle {
   val immU = UInt(32.W)
   val immJ = UInt(32.W)
 
+  // Custom-0 immediate fields (RLWIMI, encoded funct7##rs2##funct3 = SH##MB##ME).
+  // rs1 still addresses rS normally; rs2 is repurposed as immediate bits, so
+  // custom-0 ops using this form don't read a second register operand.
+  val customSH = UInt(5.W)
+  val customMB = UInt(5.W)
+  val customME = UInt(5.W)
+
   val isRType  = Bool()
   val isIType  = Bool()
   val isLoad   = Bool()
@@ -105,6 +112,12 @@ class Decoder extends Module {
   io.out.immB := Cat(Fill(19, inst(31)), inst(31), inst(7), inst(30, 25), inst(11, 8), 0.U(1.W))
   io.out.immU := Cat(inst(31, 12), 0.U(12.W))
   io.out.immJ := Cat(Fill(11, inst(31)), inst(31), inst(19, 12), inst(20), inst(30, 21), 0.U(1.W))
+
+  // Custom-0 (RLWIMI) immediate: funct7[7] ## rs2field[5] ## funct3[3] = 15 bits.
+  val customImm = Cat(inst(31, 25), inst(24, 20), inst(14, 12))
+  io.out.customSH := customImm(14, 10)
+  io.out.customMB := customImm(9, 5)
+  io.out.customME := customImm(4, 0)
 
   val isRType  = opcode === "b0110011".U
   val isIType  = opcode === "b0010011".U
@@ -163,31 +176,36 @@ object MemAccess {
   ))
 }
 
-// Dispatch table for custom-0 opcode instructions, keyed by funct3 (funct7 is
-// also available in SRV32I for sub-selecting variants if 8 funct3 slots aren't
-// enough). To add a new custom instruction:
-//   1. pick an unused funct3 code below
-//   2. add a case to `compute` that derives the result from the three operands
-//      SRV32I already wires in: rs1Data, rs2Data, and rdData (rd's *current*
-//      value, read before this instruction's writeback -- needed for any
-//      read-modify-write op like insert/merge instructions)
-//   3. if the op needs bits beyond rs1/rs2/rd/funct3/funct7 (e.g. rlwimi's
-//      SH/MB/ME fields), extend DecodedInst/Decoder with a dedicated custom
-//      immediate rather than overloading immI/immS/etc.
-// No other file needs to change: SRV32I wires isCustom into regWen/wbData
-// generically, so any op added here writes back automatically, and the same
-// rs1/rs2/rd fields already participate in the pipeline's hazard checks.
+// RLWIMI: the sole custom-0 op, encoded in immediate form (see
+// DecodedInst.customSH/MB/ME and Decoder). funct7[7]##rs2field[5]##funct3[3]
+// is repurposed as packed SH/MB/ME bits, so this op reads only rs1 (rS) and
+// rd's current value (for the merge) -- no second register operand, and no
+// funct3-based dispatch: the immediate form consumes all of funct7/rs2/funct3,
+// leaving nothing to select between multiple immediate-form ops. Any future
+// custom-0 op that keeps a real (non-immediate) funct3 selector would need
+// its own opcode point, not this encoding.
+//
+// PPC RLWIMI semantics: rA = (rotl32(rS, SH) & mask(MB,ME)) | (rA & ~mask(MB,ME))
+// MB/ME are PPC MSB-numbered (bit 0 = MSB .. bit 31 = LSB) and this
+// implementation assumes MB <= ME (no wraparound mask).
 object CustomOp {
-  val RLWIMI = 0.U(3.W) // funct3 = 000: rotate-left rs1 by shamt, insert into rd under mask
+  def rotl32(x: UInt, sh: UInt): UInt = {
+    val doubled = Cat(x, x) // 64 bits
+    (doubled >> (32.U - sh))(31, 0)
+  }
 
-  def compute(funct3: UInt, rs1Data: UInt, rs2Data: UInt, rdData: UInt): UInt = {
-    MuxLookup(funct3, rdData)(Seq(
-      // TODO: real rlwimi semantics -- result = (rotl(rs1Data, shamt) & mask) | (rdData & ~mask).
-      // shamt/mask need a dedicated immediate field (PPC packs SH/MB/ME in 15 bits,
-      // which doesn't fit funct7's 7 bits); stubbed as passthrough of rd until that
-      // encoding is defined, so the datapath/hazard plumbing below is exercised as-is.
-      RLWIMI -> rdData
-    ))
+  // PPC-style mask from MSB-numbered MB/ME (MB <= ME, no wrap).
+  def ppcMask(mb: UInt, me: UInt): UInt = {
+    val width = me -% mb +% 1.U        // 1..32
+    val low   = 31.U -% me             // LSB0 position of mask's low bit
+    val ones  = ((1.U(33.W) << width) - 1.U)(31, 0)
+    ones << low
+  }
+
+  def compute(sh: UInt, mb: UInt, me: UInt, rs1Data: UInt, rdData: UInt): UInt = {
+    val rotated = rotl32(rs1Data, sh)
+    val mask    = ppcMask(mb, me)
+    (rotated & mask) | (rdData & ~mask)
   }
 }
 
@@ -367,7 +385,8 @@ class SRV32I extends Module {
   val aluOut = ALU.compute(aluCtrl, rs1Data, aluOp2)
 
   // ---------------- Custom-0 ops ----------------
-  val customOut = CustomOp.compute(dec.funct3, rs1Data, rs2Data, rdDataCur)
+  val customOut = CustomOp.compute(dec.customSH, dec.customMB, dec.customME,
+                                    rs1Data, rdDataCur)
 
   // ---------------- Branch ----------------
   val branchUnit = Module(new BranchUnit)

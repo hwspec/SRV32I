@@ -12,11 +12,41 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path.cwd().resolve()
-AVED = ROOT / "v80-aved-platform-srv32i"
+CONFIG_FILE = ROOT / ".gwconfig"
 
+
+def load_config():
+    config = {}
+
+    if not CONFIG_FILE.exists():
+        raise RuntimeError(f"Missing config file: {CONFIG_FILE}")
+
+    for raw in CONFIG_FILE.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        config[key.strip()] = value.strip()
+
+    required = ["name", "package"]
+    missing = [key for key in required if not config.get(key)]
+    if missing:
+        raise RuntimeError(
+            "Missing required .gwconfig keys: " + ", ".join(missing)
+        )
+
+    return config
+
+
+CONFIG = load_config()
+NAME = CONFIG["name"]
+PACKAGE = CONFIG["package"]
+
+AVED = ROOT / f"v80-aved-platform-{PACKAGE}"
 AVED_HW = AVED / "hw/amd_v80_gen5x8_25.1"
 USER_ACCEL = AVED_HW / "src/rtl/user_accel"
-GENERATED = ROOT / "generated/AxiSRV32I"
+GENERATED = ROOT / "generated" / NAME
 VENV = ROOT / "chisel-axi-utils/.venv"
 
 STATUS_FILE = ROOT / ".gwstatus"
@@ -40,7 +70,7 @@ STAGE_ORDER = [
     "useracc",
     "firmware",
     "program",
-    "fpga",
+    "fpgatest",
 ]
 
 REQUIRED_STAGE_ORDER = [
@@ -53,7 +83,7 @@ REQUIRED_STAGE_ORDER = [
     "useracc",
     "firmware",
     "program",
-    "fpga",
+    "fpgatest",
 ]
 
 OPTIONAL_STAGES = {"fpgatiming"}
@@ -256,8 +286,8 @@ def prereq():
     gcc = capture(["gcc", "-dumpfullversion"])
     print(f"GCC: {gcc}")
 
-    if not gcc.startswith("12."):
-        print("WARNING: GCC 12.* is recommended.")
+    if gcc != "11.1.0":
+        print("WARNING: GCC 11.1.0 is recommended (non-strict check).")
 
     return {"verilator": verilator, "gcc": gcc}
 
@@ -284,7 +314,7 @@ def bridge():
 
 
 def rtlgen():
-    run(["sbt", "runMain srv32i.AxiSRV32I"])
+    run(["sbt", f"runMain {PACKAGE}.{NAME}"])
 
     if not GENERATED.is_dir():
         raise RuntimeError(
@@ -295,7 +325,9 @@ def rtlgen():
 
 
 def cocotb():
-    run(["make", "-C", "tests"], env=venv_env())
+    env = venv_env()
+    run(["make", "-C", "tests", "clean"], env=env)
+    run(["make", "-C", "tests"], env=env)
     return {"tests_dir": str(ROOT / "tests")}
 
 
@@ -578,7 +610,7 @@ def program():
     }
 
 
-def fpga():
+def fpgatest(testname="axisrv32i"):
     env = venv_env()
     env["AVED"] = str(AVED)
 
@@ -599,7 +631,7 @@ def fpga():
     )
 
     run(
-        ["sh", "run_on_fpga.sh", "axisrv32i"],
+        ["sh", "run_on_fpga.sh", testname],
         cwd=ROOT / "tests",
         env=env,
     )
@@ -616,7 +648,7 @@ def fpga():
     for line in lines[-30:]:
         print(line)
 
-    return {"output_log": str(output_log)}
+    return {"output_log": str(output_log), "testname": testname}
 
 
 STAGES = {
@@ -630,7 +662,7 @@ STAGES = {
     "useracc":    (["rtlgen", "aved"], useracc),
     "firmware":   (["useracc"], firmware),
     "program":    (["firmware"], program),
-    "fpga":       (["program"], fpga),
+    "fpgatest":       (["program"], fpgatest),
 }
 
 
@@ -737,11 +769,56 @@ def _run_stage_in_tmux(name):
     return result
 
 
-def run_named_stage(name):
+def run_named_stage(name, stage_args=None):
     """Run exactly one named stage; do not run dependencies."""
+    stage_args = stage_args or []
+
     if name in TMUX_STAGES:
+        if stage_args:
+            raise RuntimeError(f"Stage {name} does not accept positional arguments")
         return _run_stage_in_tmux(name)
+
+    if name == "fpgatest":
+        if len(stage_args) > 1:
+            raise RuntimeError("fpgatest accepts at most one test name")
+        testname = stage_args[0] if stage_args else "axisrv32i"
+        return _run_direct_stage_with_args(name, testname)
+
+    if stage_args:
+        raise RuntimeError(f"Stage {name} does not accept positional arguments")
+
     return _run_direct_stage(name)
+
+
+def _run_direct_stage_with_args(name, *args):
+    _, func = STAGES[name]
+
+    print()
+    print("=" * 72)
+    print(f"STAGE: {name}")
+    print("=" * 72)
+
+    set_stage_status(name, "running")
+    start = time.monotonic()
+
+    try:
+        result = func(*args)
+        elapsed = time.monotonic() - start
+
+        stage_results[name] = result
+        stage_times[name] = elapsed
+
+        record_stage_success(name, result, elapsed)
+        set_stage_status(name, "success")
+        return result
+
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        stage_times[name] = elapsed
+
+        record_stage_failure(name, elapsed, str(e))
+        set_stage_status(name, "failed")
+        raise
 
 
 def resume_workflow(start_stage=None):
@@ -855,7 +932,13 @@ def main():
         nargs="?",
         default=None,
         choices=STAGES.keys(),
-        help="Target stage; dependencies are run automatically (default: fpga)",
+        help="Run exactly one stage (default: fpgatest)",
+    )
+
+    parser.add_argument(
+        "stage_args",
+        nargs="*",
+        help="Optional arguments for the selected stage",
     )
 
     args = parser.parse_args()
@@ -890,15 +973,15 @@ def main():
 
     try:
         if args.resume is not None:
-            if args.stage is not None:
+            if args.stage is not None or args.stage_args:
                 raise RuntimeError(
                     "Use either '--resume [STAGE]' or a positional stage, not both"
                 )
             start_stage = None if args.resume == "__auto__" else args.resume
             resume_workflow(start_stage)
         else:
-            stage = args.stage or "fpga"
-            run_named_stage(stage)
+            stage = args.stage or "fpgatest"
+            run_named_stage(stage, args.stage_args)
     except subprocess.CalledProcessError as e:
         total_elapsed = time.monotonic() - total_start
         print_timing_summary(total_elapsed)

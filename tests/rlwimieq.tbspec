@@ -1,0 +1,22 @@
+programe is like below. note: this is ppc asm. big endian
+find good constant for demo
+SH=8 for to simply. allocate tmp regs reasonably.
+validate the output with a software ref
+
+
+lui   rA, %hi(CONST1)     # setting rA
+addi  rA, rA, %lo(CONST1) #
+lui   rS, %hi(CONST2)     # setting rB
+addi  rS, rS, %lo(CONST2) #
+
+lui   t2, %hi(MASK)       # t2 = upper bits of MB..ME mask
+addi  t2, t2, %lo(MASK)   # t2 = complete MB..ME mask
+
+slli  t0, rS, SH          # t0 = rS << SH
+srli  t1, rS, (32-SH)     # t1 = wrapped-around upper bits
+or    t0, t0, t1          # t0 = rotate-left(rS, SH)
+
+and   t0, t0, t2          # t0 = rotated value & mask
+xori  t2, t2, -1          # t2 = ~mask
+and   rA, rA, t2          # rA = old rA & ~mask
+or    rA, rA, t0          # rA = preserved bits | inserted bits

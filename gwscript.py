@@ -595,7 +595,7 @@ def fpga():
     )
 
     env["PARAMFN"] = str(
-        AVED_HW / "src/rtl/user_accel/SRV32I_params.json"
+        AVED_HW / "src/rtl/user_accel/params.json"
     )
 
     run(

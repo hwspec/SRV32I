@@ -3,7 +3,8 @@
 
 import cocotb
 
-from srv32i_bridge import SRV32I_Bridge, ST_ECALL, ST_HALTED, ST_ILLEGAL, ST_RUNNING, ECALL
+from srv32i_bridge import SRV32I_Bridge
+from srv32i_bridge import ST_ECALL, ST_HALTED, ST_ILLEGAL, ST_RUNNING, ECALL
 
 program = [
     0x02a00093,   # addi x1, x0, 42

@@ -3,7 +3,7 @@ TARGETS := $(patsubst %.py,fpga_%.py,$(TB_SRCS))
 
 all: $(TARGETS)
 
-$(TARGETS): fpga_%.py : %.py
+$(TARGETS): fpga_%.py : %.py srv32i_bridge.py
 	@conv_cocotb_to_fpga $^ --force
 
 clean:

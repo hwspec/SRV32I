@@ -560,6 +560,11 @@ def useracc():
 
 def firmware():
     log_path = ROOT / "aved-compile.log"
+    build_dir = AVED_HW / "build"
+
+    if build_dir.exists():
+        print(f"Removing previous firmware build directory: {build_dir}")
+        shutil.rmtree(build_dir)
 
     print(f"\n[{AVED_HW}] $ ./build_all.sh")
     print(f"Logging output to {log_path}")

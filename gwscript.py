@@ -19,7 +19,13 @@ def load_config():
     config = {}
 
     if not CONFIG_FILE.exists():
-        raise RuntimeError(f"Missing config file: {CONFIG_FILE}")
+        raise RuntimeError(
+            f"Missing config file: {CONFIG_FILE}\n"
+            "Please create .gwconfig with:\n"
+            "name=AxiSRV32I\n"
+            "package=srv32i\n"
+            "tests=loop"
+        )
 
     for raw in CONFIG_FILE.read_text().splitlines():
         line = raw.strip()
@@ -63,6 +69,19 @@ stage_results = {}
 stage_times = {}
 
 TMUX_STAGES = {"fpgatiming", "firmware"}
+
+VIVADO_REQUIRED_STAGES = {
+    "fpgatiming",
+    "aved",
+    "useracc",
+    "firmware",
+    "program",
+    "fpgatest",
+}
+
+
+def vivado_available():
+    return shutil.which("vivado") is not None
 
 STAGE_ORDER = [
     "prereq",
@@ -805,6 +824,13 @@ def run_named_stage(name, stage_args=None):
     """Run exactly one named stage; do not run dependencies."""
     stage_args = stage_args or []
 
+    if name in VIVADO_REQUIRED_STAGES and not vivado_available():
+        print(f"{name}: skipped (vivado not found in PATH)")
+        return {
+            "skipped": True,
+            "reason": "vivado not found in PATH",
+        }
+
     if name in TMUX_STAGES:
         if stage_args:
             raise RuntimeError(f"Stage {name} does not accept positional arguments")
@@ -861,9 +887,20 @@ def resume_workflow(start_stage=None):
     stage, regardless of previous success markers. fpgatiming remains optional
     and runs only when explicitly selected.
 
-    If start_stage is omitted, begin at the first unfinished runnable required
-    stage and continue forward, skipping stages already marked successful.
+    If Vivado is not in PATH, Vivado-dependent stages are skipped for this run
+    and their .gwstatus entries are left unchanged.
     """
+    have_vivado = vivado_available()
+
+    if not have_vivado:
+        print(
+            "Vivado not found in PATH; skipping: "
+            + ", ".join(
+                name for name in STAGE_ORDER
+                if name in VIVADO_REQUIRED_STAGES
+            )
+        )
+
     if start_stage == "fpgatiming":
         run_named_stage("fpgatiming")
         return
@@ -877,6 +914,10 @@ def resume_workflow(start_stage=None):
         start_index = order.index(start_stage)
 
         for name in order[start_index:]:
+            if name in VIVADO_REQUIRED_STAGES and not have_vivado:
+                print(f"{name}: skipped (vivado not found in PATH)")
+                continue
+
             print(f"\nResuming stage: {name}")
             run_named_stage(name)
 
@@ -890,6 +931,10 @@ def resume_workflow(start_stage=None):
     start_index = order.index(first)
 
     for name in order[start_index:]:
+        if name in VIVADO_REQUIRED_STAGES and not have_vivado:
+            print(f"{name}: skipped (vivado not found in PATH)")
+            continue
+
         status = load_status()
 
         if status.get(name) == "success":
@@ -898,7 +943,11 @@ def resume_workflow(start_stage=None):
         deps, _ = STAGES[name]
         required_deps = [dep for dep in deps if dep not in OPTIONAL_STAGES]
 
-        missing = [dep for dep in required_deps if status.get(dep) != "success"]
+        missing = [
+            dep for dep in required_deps
+            if status.get(dep) != "success"
+            and not (dep in VIVADO_REQUIRED_STAGES and not have_vivado)
+        ]
         if missing:
             raise RuntimeError(
                 f"Cannot resume {name}: dependencies not successful: "

@@ -1,3 +1,7 @@
+// Copyright (c) 2026, UChicago Argonne, LLC.
+// License: See LICENSE in the project top-level directory.
+// Main author: Kazutomo Yoshii <kazutomo@anl.gov>
+
 // =============================================================================
 // AXI4-Lite Bridge for SRV32I
 // Package: srv32i

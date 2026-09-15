@@ -1,3 +1,7 @@
+// Copyright (c) 2026, UChicago Argonne, LLC.
+// License: See LICENSE in the project top-level directory.
+// Main author: Kazutomo Yoshii <kazutomo@anl.gov>
+
 package srv32i
 
 import chisel3._

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#                                                                                                                                            # Copyright (c) 2026, UChicago Argonne, LLC.                                                                                                 # License: See LICENSE in the project top-level directory.                                                                                   # Main author: Kazutomo Yoshii <kazutomo@anl.gov>
 
 import argparse
 import json

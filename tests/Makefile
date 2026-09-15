@@ -12,10 +12,10 @@ VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
 WAVES = 1
 EXTRA_ARGS += --trace --trace-structs
 
-TARGETS=basic loop rlwimieq rlwimi
+TARGETS=loop rlwimieq rlwimi
 
 all:
-	make basic
+	make loop
 
 $(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
 	@echo $(VERILOG_SOURCES)

@@ -42,6 +42,11 @@ def load_config():
 CONFIG = load_config()
 NAME = CONFIG["name"]
 PACKAGE = CONFIG["package"]
+TESTS = [
+    item.strip()
+    for item in CONFIG.get("tests", "").split(",")
+    if item.strip()
+]
 
 AVED = ROOT / f"v80-aved-platform-{PACKAGE}"
 AVED_HW = AVED / "hw/amd_v80_gen5x8_25.1"
@@ -325,10 +330,20 @@ def rtlgen():
 
 
 def cocotb():
+    if not TESTS:
+        raise RuntimeError("No tests defined in .gwconfig (example: tests=basic,loop)")
+
     env = venv_env()
     run(["make", "-C", "tests", "clean"], env=env)
-    run(["make", "-C", "tests"], env=env)
-    return {"tests_dir": str(ROOT / "tests")}
+
+    for testname in TESTS:
+        print(f"\nRunning cocotb test target: {testname}")
+        run(["make", "-C", "tests", testname], env=env)
+
+    return {
+        "tests_dir": str(ROOT / "tests"),
+        "tests": TESTS,
+    }
 
 
 def _set_xdc_period(xdc_path, period_ns):
@@ -615,7 +630,7 @@ def program():
     }
 
 
-def fpgatest(testname="axisrv32i"):
+def fpgatest(testname=None):
     env = venv_env()
     env["AVED"] = str(AVED)
 
@@ -635,25 +650,37 @@ def fpgatest(testname="axisrv32i"):
         AVED_HW / "src/rtl/user_accel/params.json"
     )
 
-    run(
-        ["sh", "run_on_fpga.sh", testname],
-        cwd=ROOT / "tests",
-        env=env,
-    )
+    targets = [testname] if testname else TESTS
+    if not targets:
+        raise RuntimeError("No tests defined in .gwconfig (example: tests=basic,loop)")
 
-    output_log = ROOT / "tests/output.log"
+    results = []
 
-    if not output_log.is_file():
-        raise RuntimeError(f"Expected output file not found: {output_log}")
+    for target in targets:
+        print(f"\nRunning FPGA test target: {target}")
+        run(
+            ["sh", "run_on_fpga.sh", target],
+            cwd=ROOT / "tests",
+            env=env,
+        )
 
-    print(f"\nFPGA output: {output_log}")
-    print("-" * 72)
+        output_log = ROOT / "tests/output.log"
+        if not output_log.is_file():
+            raise RuntimeError(f"Expected output file not found: {output_log}")
 
-    lines = output_log.read_text(errors="replace").splitlines()
-    for line in lines[-30:]:
-        print(line)
+        print(f"\nFPGA output ({target}): {output_log}")
+        print("-" * 72)
 
-    return {"output_log": str(output_log), "testname": testname}
+        lines = output_log.read_text(errors="replace").splitlines()
+        for line in lines[-30:]:
+            print(line)
+
+        results.append({
+            "testname": target,
+            "output_log": str(output_log),
+        })
+
+    return {"tests": results}
 
 
 STAGES = {
@@ -786,7 +813,7 @@ def run_named_stage(name, stage_args=None):
     if name == "fpgatest":
         if len(stage_args) > 1:
             raise RuntimeError("fpgatest accepts at most one test name")
-        testname = stage_args[0] if stage_args else "axisrv32i"
+        testname = stage_args[0] if stage_args else None
         return _run_direct_stage_with_args(name, testname)
 
     if stage_args:
@@ -985,8 +1012,14 @@ def main():
             start_stage = None if args.resume == "__auto__" else args.resume
             resume_workflow(start_stage)
         else:
-            stage = args.stage or "fpgatest"
-            run_named_stage(stage, args.stage_args)
+            if args.stage is None:
+                if args.stage_args:
+                    raise RuntimeError(
+                        "Stage arguments require an explicit stage name"
+                    )
+                resume_workflow()
+            else:
+                run_named_stage(args.stage, args.stage_args)
     except subprocess.CalledProcessError as e:
         total_elapsed = time.monotonic() - total_start
         print_timing_summary(total_elapsed)

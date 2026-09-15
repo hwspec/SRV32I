@@ -62,7 +62,7 @@ async def tb_rlwimi(cocotb_dut):
     assert await dut.readReg(10) == expected_rA
 
     cycles = await dut.readCycles()
-    dut.log.info(f"cycles = {cycles}")
+    dut.log.info(f"rlwimi cycles = {cycles - 6}")
     assert cycles > 0, "Cycle counter should be non-zero after execution"
 
     dut.log.info("Verified!")

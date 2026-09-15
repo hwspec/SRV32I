@@ -24,7 +24,8 @@ def load_config():
             "Please create .gwconfig with:\n"
             "name=AxiSRV32I\n"
             "package=srv32i\n"
-            "tests=loop"
+            "tests=loop\n"
+            "fpgatest=true"
         )
 
     for raw in CONFIG_FILE.read_text().splitlines():
@@ -70,7 +71,7 @@ stage_times = {}
 
 TMUX_STAGES = {"fpgatiming", "firmware"}
 
-VIVADO_REQUIRED_STAGES = {
+FPGA_STAGES = {
     "fpgatiming",
     "aved",
     "useracc",
@@ -80,8 +81,24 @@ VIVADO_REQUIRED_STAGES = {
 }
 
 
-def vivado_available():
-    return shutil.which("vivado") is not None
+def config_bool(name, default=False):
+    value = CONFIG.get(name)
+    if value is None:
+        return default
+
+    value = value.strip().lower()
+
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+
+    raise RuntimeError(
+        f"Invalid boolean value in .gwconfig: {name}={CONFIG[name]}"
+    )
+
+
+FPGA_ENABLED = config_bool("fpgatest", default=False)
 
 STAGE_ORDER = [
     "prereq",
@@ -824,11 +841,11 @@ def run_named_stage(name, stage_args=None):
     """Run exactly one named stage; do not run dependencies."""
     stage_args = stage_args or []
 
-    if name in VIVADO_REQUIRED_STAGES and not vivado_available():
-        print(f"{name}: skipped (vivado not found in PATH)")
+    if name in FPGA_STAGES and not FPGA_ENABLED:
+        print(f"{name}: skipped (fpgatest=false in .gwconfig)")
         return {
             "skipped": True,
-            "reason": "vivado not found in PATH",
+            "reason": "fpgatest=false in .gwconfig",
         }
 
     if name in TMUX_STAGES:
@@ -887,17 +904,15 @@ def resume_workflow(start_stage=None):
     stage, regardless of previous success markers. fpgatiming remains optional
     and runs only when explicitly selected.
 
-    If Vivado is not in PATH, Vivado-dependent stages are skipped for this run
-    and their .gwstatus entries are left unchanged.
+    If fpgatest=false in .gwconfig, FPGA-related stages are skipped and their
+    .gwstatus entries are left unchanged.
     """
-    have_vivado = vivado_available()
-
-    if not have_vivado:
+    if not FPGA_ENABLED:
         print(
-            "Vivado not found in PATH; skipping: "
+            "fpgatest=false in .gwconfig; skipping: "
             + ", ".join(
                 name for name in STAGE_ORDER
-                if name in VIVADO_REQUIRED_STAGES
+                if name in FPGA_STAGES
             )
         )
 
@@ -914,8 +929,8 @@ def resume_workflow(start_stage=None):
         start_index = order.index(start_stage)
 
         for name in order[start_index:]:
-            if name in VIVADO_REQUIRED_STAGES and not have_vivado:
-                print(f"{name}: skipped (vivado not found in PATH)")
+            if name in FPGA_STAGES and not FPGA_ENABLED:
+                print(f"{name}: skipped (fpgatest=false in .gwconfig)")
                 continue
 
             print(f"\nResuming stage: {name}")
@@ -931,8 +946,8 @@ def resume_workflow(start_stage=None):
     start_index = order.index(first)
 
     for name in order[start_index:]:
-        if name in VIVADO_REQUIRED_STAGES and not have_vivado:
-            print(f"{name}: skipped (vivado not found in PATH)")
+        if name in FPGA_STAGES and not FPGA_ENABLED:
+            print(f"{name}: skipped (fpgatest=false in .gwconfig)")
             continue
 
         status = load_status()
@@ -946,7 +961,7 @@ def resume_workflow(start_stage=None):
         missing = [
             dep for dep in required_deps
             if status.get(dep) != "success"
-            and not (dep in VIVADO_REQUIRED_STAGES and not have_vivado)
+            and not (dep in FPGA_STAGES and not FPGA_ENABLED)
         ]
         if missing:
             raise RuntimeError(

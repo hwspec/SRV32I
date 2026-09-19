@@ -12,10 +12,11 @@ VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
 WAVES = 1
 EXTRA_ARGS += --trace --trace-structs
 
-TARGETS=loop rlwimieq rlwimi
+TARGETS=loop_hex rlwimieq rlwimi     # does not require riscv toolchain
+TARGETS+=loop_asm sum_c embeddedasm  # requires riscv toolchain
 
 all:
-	make loop
+	make loop_hex
 
 $(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
 	@echo $(VERILOG_SOURCES)

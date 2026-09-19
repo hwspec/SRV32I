@@ -33,11 +33,6 @@ async def tb_rlwimieq(cocotb_dut):
 
     st = await dut.run(program, entry=0)
 
-    assert st & ST_ECALL, f"ecall not set: {st:#010x}"
-    assert st & ST_HALTED, f"halted not set: {st:#010x}"
-    assert not (st & ST_ILLEGAL), f"illegal set: {st:#010x}"
-    assert not (st & ST_RUNNING), f"still running: {st:#010x}"
-
     CONST1 = 0x12345678
     CONST2 = 0xABCDEF01
     MASK = 0x0000FF00

@@ -79,7 +79,7 @@ class SRV32I_Bridge(COCOTB_Bridge):
         return (hi << 32) | lo
 
     # -- run helper (mirrors R2_Bridge.run) --------------------------------
-    async def run(self, prog=None, entry=0, timeout=50000):
+    async def run(self, prog=None, entry=0, timeout=50000, check_halt=True):
         await self.enable(0)
         if prog:
             await self.loadProg(prog)
@@ -87,4 +87,15 @@ class SRV32I_Bridge(COCOTB_Bridge):
         await self.enable(1)
         st = await self.waitForHalt(timeout)
         await self.enable(0)   # disable so dmem/imem are readable again
+
+        if check_halt:
+            assert st & ST_ECALL, f"ecall not set: {st:#010x}"
+            assert st & ST_HALTED, f"halted not set: {st:#010x}"
+            assert not (st & ST_ILLEGAL), f"illegal set: {st:#010x}"
+            assert not (st & ST_RUNNING), f"still running: {st:#010x}"
+            # check_halt=True asserts a clean ecall halt -- the common case
+            # for every testbench so far. Pass check_halt=False for tests
+            # that deliberately expect an illegal-instruction halt or other
+            # non-ecall status, and check `st` yourself.
+
         return st

@@ -49,11 +49,6 @@ async def tb_rlwimi(cocotb_dut):
 
     st = await dut.run(program, entry=0)
 
-    assert st & ST_ECALL, f"ecall not set: {st:#010x}"
-    assert st & ST_HALTED, f"halted not set: {st:#010x}"
-    assert not (st & ST_ILLEGAL), f"illegal set: {st:#010x}"
-    assert not (st & ST_RUNNING), f"still running: {st:#010x}"
-
     mask = ppc_mask(MB, ME)
     rotated = rotl32(CONST2, SH)
     expected_rA = (CONST1 & ~mask & 0xFFFFFFFF) | (rotated & mask)

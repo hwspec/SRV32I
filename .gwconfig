@@ -1,5 +1,5 @@
 name=AxiSRV32I
 package=srv32i
-tests=loop
+tests=loop_hex
 fpgatest=false
 

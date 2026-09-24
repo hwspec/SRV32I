@@ -18,8 +18,11 @@ known limitations.
 - GCC (tested with 11.1.0 and 15.2.1)
 - Java (tested with OpenJDK 17.0.7 and 21.0.11)
 - sbt (tested with 1.9.2 and 2.0.8)
-- [optional] RV32 cross compiler (tested with riscv32-linux-gnu-gcc 15.2.1) to run non-hex tests
+
 - [optional] Vivado 2025.1 to compile FPGA firmware and program
+- [optional] RV32 cross compiler (tested with riscv32-linux-gnu-gcc 15.2.1) to run non-hex tests such as fpgatest=tru
+e
+
 
 
 ## Build and run tests on Verilator

@@ -60,7 +60,7 @@ AVED = ROOT / f"v80-aved-platform-{PACKAGE}"
 AVED_HW = AVED / "hw/amd_v80_gen5x8_25.1"
 USER_ACCEL = AVED_HW / "src/rtl/user_accel"
 GENERATED = ROOT / "generated" / NAME
-VENV = ROOT / "chisel-axi-utils/.venv"
+VENV = ROOT / "garageworks/.venv"
 
 STATUS_FILE = ROOT / ".gwstatus"
 RESULTS_FILE = ROOT / ".gwstage-results.json"
@@ -351,7 +351,7 @@ def repo():
 
 
 def bridge():
-    run(["make", "-C", "chisel-axi-utils", "setup"])
+    run(["make", "-C", "garageworks", "setup"])
     return {"venv": str(VENV)}
 
 

@@ -18,32 +18,32 @@ known limitations.
 - GCC (tested with 11.1.0 and 15.2.1)
 - Java (tested with OpenJDK 17.0.7 and 21.0.11)
 - sbt (tested with 1.9.2 and 2.0.8)
+- Python 3 with `venv` and `pip`
 
 - [optional] Vivado 2025.1 to compile FPGA firmware and program
-- [optional] RV32 cross compiler (tested with riscv32-linux-gnu-gcc 15.2.1) to run non-hex tests such as fpgatest=tru
-e
+- [optional] RV32 cross compiler (tested with riscv32-linux-gnu-gcc 15.2.1) to run non-hex tests such as sum_c, loop_asm
 
 
 
 ## Build and run tests on Verilator
 
-The command below prepares environment, build, and run the default test (tests/tb_loop_hex.py).
+The command below prepares the environment, builds the designs, and run the default test (tests/tb_loop_hex.py).
 ```
 python ./gwscript.py
 ```
 
 To run other tests
 ```
-source chisel-axi-utils/.venv/bin/activate
+source garageworks/.venv/bin/activate
 cd tests
 make rlmiwi
 ```
-Note: to run loop_asm, sum_c, RV32 cross compiler is needed.
+Note: to run loop_asm, sum_c, an RV32 cross compiler is needed.
 
 
 ## FPGA tests
 
-- Supported FPGA platform : AMD Alveo V80 FPGA with AVED
+- Supported FPGA platform: AMD Alveo V80 FPGA with AVED
 
 If you want to run FPGA tests on the V80 AVED stack, set up the environment
 to build the V80 AVED stack first:
@@ -67,24 +67,17 @@ python ./gwscript.py
 
 ## Why this is a GarageWorks example
 
-GarageWorks testbenches never poke DUT signals directly; every command goes
-over AXI. That constraint is what makes a testbench portable: the same
-cocotb test, run against `AxiSRV32I.scala`'s register map, works whether the
-"AXI slave" underneath is a Verilator/cocotb simulation or an actual AXI4-Lite
-endpoint on the V80. `chisel-axi-utils`' `conv_cocotb_to_fpga` tool handles the
-sim to FPGA rebasing, so `run_on_fpga.sh` and the `tests/Makefile` target
-drive the exact same `tb_*.py` sources; one GarageWorks-style test source,
-two run targets.
+GarageWorks testbenches never poke DUT signals directly; every command
+goes over AXI. That constraint is what makes a testbench portable: the
+same cocotb test, run against `AxiSRV32I.scala`'s register map, works
+whether the "AXI slave" underneath is a Verilator/cocotb simulation or
+an actual AXI4-Lite endpoint on the V80. `conv_cocotb_to_fpga` tool
+handles the sim to FPGA rebasing, so `run_on_fpga.sh` and the
+`tests/Makefile` target drive the exact same `tb_*.py` sources; one
+GarageWorks-style test source, two run targets.
 
 ## GarageWorks status
 
-GarageWorks will be open-sourced soon. For now, use `chisel-axi-utils`,
-which has everything needed to build and run this repo's tests:
-
-- [`hwspec/chisel-axi-utils`](https://github.com/hwspec/chisel-axi-utils.git):
-  the `COCOTB_Bridge` base class, the AXI-bridge/testbench generation
-  approach, and `conv_cocotb_to_fpga` for the sim-to-FPGA rebasing described
-  above
 - `gwscript.py`: currently local to this repo; it'll move into GarageWorks
   once that's released
 

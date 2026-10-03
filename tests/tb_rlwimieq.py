@@ -1,6 +1,6 @@
 import cocotb
 
-from srv32i_bridge import SRV32I_Bridge, ST_ECALL, ST_HALTED, ST_ILLEGAL, ST_RUNNING, ECALL
+from srv32i_bridge import SRV32I_Bridge, ECALL
 
 program = [
     0x12345537,   # lui x10, 0x12345          (rA hi)

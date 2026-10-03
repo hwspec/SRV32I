@@ -1,6 +1,6 @@
 import cocotb
 
-from srv32i_bridge import SRV32I_Bridge, ST_ECALL, ST_HALTED, ST_ILLEGAL, ST_RUNNING
+from srv32i_bridge import SRV32I_Bridge
 from rv32i_compile import compile_prog
 
 ASM = """

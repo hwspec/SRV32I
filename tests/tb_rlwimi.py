@@ -1,6 +1,6 @@
 import cocotb
 
-from srv32i_bridge import SRV32I_Bridge, ST_ECALL, ST_HALTED, ST_ILLEGAL, ST_RUNNING, ECALL
+from srv32i_bridge import SRV32I_Bridge, ECALL
 
 
 def rotl32(v, sh):

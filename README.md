@@ -54,16 +54,54 @@ source $INSTDIR/2025.1/Vitis/settings64.sh
 export PATH="$INSTDIR/2025.1/gnu/armr5/lin/gcc-arm-none-eabi/bin:$PATH"
 ```
 
-Edit .gwconfig
-```
-fpgatest=true
-```
-
 Then,
 ```
-python ./gwscript.py
+python ./gwscript.py --fpga
 ```
 
+
+## gwscript options
+
+```
+python ./gwscript.py --status        # stage states, incl. computed "stale (reason)"
+python ./gwscript.py --dry-run       # what would run and why; runs nothing
+python ./gwscript.py --resume [STAGE]
+python ./gwscript.py --clean | --clean-all
+```
+
+- A successful stage becomes **stale** when an upstream stage re-runs or its
+  inputs change (sources, tests, relevant `.gwconfig` keys, AVED-gw commit);
+  `--resume` re-runs stale stages.
+- Ctrl-C / SIGTERM / tmux kill marks a stage **interrupted**; it is re-run on resume.
+- One gwscript per project at a time (`.gwlock`); `programhw`/`testhw` also take a
+  per-board lock in `/tmp`, shared across users.
+- Each stage result in `.gwstage-results.json` records provenance (host, tool
+  versions, git commit/dirty, config).
+- tmux stage logs are rotated in `.gwlogs`; keep count via `log_keep=` (default 5).
+
+## gwscript as an MCP server
+
+The same script runs as an MCP server, so Claude Code (or any MCP client) can
+drive the workflow. Tools call the command line underneath, so state, locks and
+logs are shared with local runs.
+
+```
+pip install mcp
+claude mcp add gwscript -- python /path/to/SRV32I/gwscript.py -C /path/to/SRV32I --mcp
+```
+
+Tools: `status`, `dry_run`, `next_stage`, `results`, `log`, `run`, `job`, `jobs`,
+`cancel`, `clean`, `sudoers`. `run` starts a background job and returns at once
+(builds take hours); poll `job`/`status`/`log`. Jobs live in `.gwjobs/` and
+survive server restarts. `cancel` marks the stage interrupted (and kills a tmux build).
+
+Non-interactive runs (MCP, tmux) cannot prompt for a password, so `programhw`
+needs passwordless sudo for `ami_tool` and the PCIe rescan:
+
+```
+python ./gwscript.py --sudoers          # prints the line to add
+sudo visudo -f /etc/sudoers.d/gwscript
+```
 
 ## Why this is a GarageWorks example
 

@@ -340,13 +340,17 @@ project/plugins/project/
 hs_err_pid*
 
 
-
+.gwlock
+.gwstage-results.json
+.gwstatus
+AVED-gw/
 generated/
 scripts/AxiSRV32I.scala
 scripts/Makefile
 scripts/tb_axisrv32i.py
-tests/__pycache__/
-tests/dump.vcd
-tests/results.xml
-tests/sim_build/
-
+gwtests/__pycache__/
+gwtests/dump.vcd
+gwtests/results.xml
+gwtests/sim_build/
+gwtests/fpga_srv32i_bridge.py
+gwtests/fpga_tb*.py

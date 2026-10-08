@@ -27,7 +27,7 @@ known limitations.
 
 ## Build and run tests on Verilator
 
-The command below prepares the environment, builds the designs, and run the default test (tests/tb_loop_hex.py).
+The command below prepares the environment, builds the designs, and run the default test (gwtests/tb_loop_hex.py).
 ```
 python ./gwscript.py
 ```
@@ -35,8 +35,8 @@ python ./gwscript.py
 To run other tests
 ```
 source garageworks/.venv/bin/activate
-cd tests
-make rlmiwi
+cd gwtests
+make rlwimi
 ```
 Note: to run loop_asm, sum_c, an RV32 cross compiler is needed.
 
@@ -110,8 +110,8 @@ goes over AXI. That constraint is what makes a testbench portable: the
 same cocotb test, run against `AxiSRV32I.scala`'s register map, works
 whether the "AXI slave" underneath is a Verilator/cocotb simulation or
 an actual AXI4-Lite endpoint on the V80. `conv_cocotb_to_fpga` tool
-handles the sim to FPGA rebasing, so `run_on_fpga.sh` and the
-`tests/Makefile` target drive the exact same `tb_*.py` sources; one
+handles the sim to FPGA rebasing, so `make <test>` and `make hw_<test>`
+in `gwtests/Makefile` drive the exact same `tb_*.py` sources; one
 GarageWorks-style test source, two run targets.
 
 ## GarageWorks status
@@ -128,13 +128,12 @@ src/main/scala/srv32i/
   AxiSRV32I.scala        # AXI4-Lite wrapper (register map, imem/dmem backing)
 src/test/scala/src32i/
   SRV32ISpec.scala       # Scala-level ChiselSim spec (unit-level, not GarageWorks/cocotb)
-tests/
+gwtests/
   tb_loop.py              # loop test
   tb_rlwimi.py             # custom rlwimi extension test
   tb_rlwimieq.py           # rlwimi-equivalent sequence of plain RV32I instructions
   srv32i_bridge.py         # SRV32I-specific COCOTB_Bridge subclass
-  Makefile                 # cocotb simulation target
-  run_on_fpga.sh            # runs the same tests against the V80
+  Makefile                 # make <test> (sim), make hw_<test> (V80), make list
 ```
 
 

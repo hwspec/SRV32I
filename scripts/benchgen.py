@@ -72,8 +72,8 @@ def fetch_example(example: str) -> dict[str, str]:
         )
         root = Path(tmp)
         bridge = root / "src/main/scala/axi_examples" / f"Axi4Lite32{hwname}.scala"
-        tb = root / "tests" / hwname / f"tb_{hwname.lower()}.py"
-        makefile = root / "tests" / hwname / "Makefile"
+        tb = root / "gwtests" / hwname / f"tb_{hwname.lower()}.py"
+        makefile = root / "gwtests" / hwname / "Makefile"
         return {
             "bridge": bridge.read_text(),
             "tb": tb.read_text(),

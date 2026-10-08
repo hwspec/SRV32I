@@ -222,7 +222,8 @@ STAGE_INPUTS = {
         "config": ["tests"],
     },
     "fpgatiming": {"git": [AVED]},
-    "aved": {"git": [AVED], "config": ["aved_repo"]},
+    # not the AVED-gw commit: the clone doesn't exist yet when aved starts
+    "aved": {"config": ["aved_repo"]},
     "buildhw": {"git": [AVED]},
     "programhw": {"config": ["bdf"]},
     "testhw": {
@@ -257,6 +258,10 @@ class StageInterrupted(BaseException):
 
 def _on_signal(signum, frame):
     raise StageInterrupted(signal.Signals(signum).name)
+
+
+def _cmd_str(cmd):
+    return " ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else str(cmd)
 
 
 def _noninteractive():
@@ -613,6 +618,23 @@ def status_report():
         report.append(item)
 
     return report
+
+
+def accept_stage(name):
+    """Treat a stage's current inputs as the ones it succeeded with.
+
+    Re-fingerprints the inputs without re-running.  The run_id is kept, so
+    downstream stages that used this run stay fresh.
+    """
+    data = load_stage_results()
+    last = (data.get(name) or {}).get("last_success")
+    if load_status().get(name) != "success" or not last:
+        raise RuntimeError(f"{name} has no successful run to accept")
+
+    last["inputs_hash"] = _inputs_hash(name)
+    last["accepted"] = _now()
+    save_stage_results(data)
+    print(f"{name}: inputs accepted")
 
 
 def show_status(as_json=False):
@@ -1285,8 +1307,10 @@ def _execute_stage(name, *args):
     if name in SUDO_STAGES:
         if _noninteractive():
             _check_nopasswd_sudo()
-        else:
-            # prompt now, in the foreground, so later sudo calls don't block
+        elif _missing_nopasswd():
+            # prompt now, in the foreground, so later sudo calls don't block.
+            # (Skipped with NOPASSWD rules: sudo -v would still ask for a
+            # password, and fails for users without general sudo rights.)
             run(["sudo", "-v"])
 
     board_lock = None
@@ -1353,14 +1377,20 @@ def sudoers_line():
     return f"{user} ALL=(root) NOPASSWD: {cmds}"
 
 
-def _check_nopasswd_sudo():
-    """Fail fast (instead of hanging) if sudo would need a password."""
+def _missing_nopasswd():
+    """SUDO_COMMANDS that sudo would not run without a password."""
     missing = []
     for cmd in SUDO_COMMANDS:
         r = subprocess.run(["sudo", "-n", "-l", *cmd],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if r.returncode != 0:
             missing.append(" ".join(cmd))
+    return missing
+
+
+def _check_nopasswd_sudo():
+    """Fail fast (instead of hanging) if sudo would need a password."""
+    missing = _missing_nopasswd()
 
     if missing:
         raise RuntimeError(
@@ -2017,6 +2047,14 @@ def _main():
     )
 
     parser.add_argument(
+        "--accept",
+        nargs="+",
+        metavar="STAGE",
+        choices=list(STAGES.keys()),
+        help="Mark a stage's current inputs as up to date without re-running it",
+    )
+
+    parser.add_argument(
         "--next",
         action="store_true",
         help="Show the next runnable stage",
@@ -2086,7 +2124,8 @@ def _main():
             sys.exit(130)
         except subprocess.CalledProcessError as e:
             print(
-                f"\nERROR: command failed with exit code {e.returncode}",
+                f"\nERROR: command failed with exit code {e.returncode}: "
+                f"{_cmd_str(e.cmd)}",
                 file=sys.stderr,
             )
             sys.exit(e.returncode or 1)
@@ -2107,6 +2146,12 @@ def _main():
 
         if not STATUS_FILE.exists():
             save_status(default_status())
+
+        if args.accept:
+            lock = _acquire_project_lock()
+            for name in args.accept:
+                accept_stage(name)
+            return
 
         if args.status or args.next or args.dry_run:
             # read-only; tidy up dead 'running' entries only if nobody else is active
@@ -2159,7 +2204,8 @@ def _main():
     except subprocess.CalledProcessError as e:
         print_timing_summary(time.monotonic() - total_start)
         print(
-            f"\nERROR: command failed with exit code {e.returncode}",
+            f"\nERROR: command failed with exit code {e.returncode}: "
+            f"{_cmd_str(e.cmd)}",
             file=sys.stderr,
         )
         sys.exit(e.returncode or 1)

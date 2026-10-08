@@ -1202,9 +1202,10 @@ def programhw():
         _pci_rescan()
 
     if _device_present():
-        # sbr removes the device itself and rescans; re-check afterwards
-        run(["sudo", AMI_TOOL, "reload", "-t", "sbr", "-d", BDF],
-            ignore_returncode=True)
+        # sbr removes the device itself and rescans; re-check afterwards.
+        # Must succeed: without the reload the new bitstream isn't usable,
+        # even though the device may still show up on PCIe.
+        run(["sudo", AMI_TOOL, "reload", "-t", "sbr", "-d", BDF])
         time.sleep(2)
 
     if not _device_present():
@@ -1377,13 +1378,52 @@ def sudoers_line():
     return f"{user} ALL=(root) NOPASSWD: {cmds}"
 
 
+def _nopasswd_paths():
+    """
+    Command paths the user may run with NOPASSWD, from `sudo -n -l`.
+    'ALL' means every command.  Empty if sudo can't list without a password.
+    """
+    r = subprocess.run(["sudo", "-n", "-l"], text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:
+        return set()
+
+    paths = set()
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("(") or ")" not in line:
+            continue                     # only rule lines: "(root) NOPASSWD: ..."
+        nopasswd = False
+        for item in line.split(")", 1)[1].split(","):
+            item = item.strip()
+            # tags carry over to the following commands until changed
+            while ":" in item and item.split(":", 1)[0].isupper():
+                tag, item = item.split(":", 1)
+                item = item.strip()
+                if tag == "NOPASSWD":
+                    nopasswd = True
+                elif tag == "PASSWD":
+                    nopasswd = False
+            if nopasswd and item:
+                paths.add(item.split()[0])
+    return paths
+
+
 def _missing_nopasswd():
-    """SUDO_COMMANDS that sudo would not run without a password."""
+    """
+    SUDO_COMMANDS that sudo would not run without a password.
+
+    `sudo -n -l <cmd>` alone isn't enough: it succeeds whenever the command is
+    *allowed*, even if running it would still ask for a password.  So the
+    command must also appear under a NOPASSWD tag.
+    """
+    nopasswd = _nopasswd_paths()
     missing = []
     for cmd in SUDO_COMMANDS:
-        r = subprocess.run(["sudo", "-n", "-l", *cmd],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if r.returncode != 0:
+        allowed = subprocess.run(["sudo", "-n", "-l", *cmd],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode == 0
+        if not (allowed and ("ALL" in nopasswd or cmd[0] in nopasswd)):
             missing.append(" ".join(cmd))
     return missing
 

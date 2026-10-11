@@ -1305,14 +1305,11 @@ def _execute_stage(name, *args):
     print(f"STAGE: {name}")
     print("=" * 72)
 
-    if name in SUDO_STAGES:
-        if _noninteractive():
-            _check_nopasswd_sudo()
-        elif _missing_nopasswd():
-            # prompt now, in the foreground, so later sudo calls don't block.
-            # (Skipped with NOPASSWD rules: sudo -v would still ask for a
-            # password, and fails for users without general sudo rights.)
-            run(["sudo", "-v"])
+    # Non-interactive runs (MCP, tmux) can't answer a password prompt, so
+    # check NOPASSWD up front (sudo -n never prompts).  Interactive runs
+    # just run the sudo commands; sudo itself prompts only if it must.
+    if name in SUDO_STAGES and _noninteractive():
+        _check_nopasswd_sudo()
 
     board_lock = None
     if name in BOARD_STAGES:

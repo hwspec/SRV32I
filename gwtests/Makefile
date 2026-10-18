@@ -1,16 +1,12 @@
 #
-# This is Makefile for cocotb and fpga
+# Common Makefile for cocotb + FPGA testbenches (gwtests framework)
 #
-
-HWMODULENAME=AxiSRV32I
-BRIDGEBN=srv32i_bridge
-TOPNAME=wrapper
-SRCDIR = $(abspath ../generated/$(HWMODULENAME))
-
-TARGETS =loop_hex rlwimieq rlwimi    # does not require riscv toolchain
-TARGETS+=loop_asm sum_c embeddedasm  # requires riscv toolchain
-
-.DEFAULT_GOAL := loop_hex
+# Repository-specific settings (HWMODULENAME, BRIDGEBN, TOPNAME, SRCDIR,
+# TARGETS, and the rule that (re)generates $(SRCDIR)/$(HWMODULENAME).sv)
+# live in the *.mk file included below. Drop in a different *.mk to reuse
+# this Makefile for another repository.
+#
+include $(wildcard *.mk)
 
 WAVES ?= 0
 ifeq ($(WAVES),1)
@@ -20,7 +16,6 @@ endif
 SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
 VERILOG_SOURCES += $(wildcard $(SRCDIR)/*.v $(SRCDIR)/*.sv)
-SCALA_SRCS := $(shell find ../src -name '*.scala') ../build.sbt
 
 .PHONY: $(TARGETS) list gen sim-all hw-all
 
@@ -30,10 +25,10 @@ $(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
 	@PARAMFN=$(SRCDIR)/params.json $(MAKE) sim MODULE=tb_$@ TOPLEVEL=$(TOPNAME)
 
 $(SRCDIR)/$(HWMODULENAME).sv: $(SCALA_SRCS)
-	(cd ../ ; sbt "runMain srv32i.AxiSRV32I")
+	$(GENCMD)
 
 gen:
-	(cd ../ ; sbt "runMain srv32i.AxiSRV32I")
+	$(GENCMD)
 
 sim-all: $(TARGETS)
 hw-all: $(addprefix hw_,$(TARGETS))

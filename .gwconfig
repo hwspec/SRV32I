@@ -1,4 +1,6 @@
 name=AxiSRV32I
 package=srv32i
+testdir=gwtests
 tests=loop_hex
+
 

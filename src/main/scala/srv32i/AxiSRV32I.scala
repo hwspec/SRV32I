@@ -38,9 +38,9 @@
 
 package srv32i
 
-import axi._
-import axi.AxiLiteResp._
-import axi.AxiModuleParamsHelper._
+import garageworks._
+import garageworks.AxiLiteResp._
+import garageworks.AxiModuleParamsHelper._
 import upickle.default._
 
 import chisel3._
@@ -90,7 +90,7 @@ object SRV32IModuleParams {
 }
 
 class AxiSRV32I(p: SRV32IModuleParams, debugprint: Boolean = false)
-    extends chisel3.Module with axi.HasAxiLite32IO {
+    extends chisel3.Module with garageworks.HasAxiLite32IO {
 
   override val S = IO(new AxiLite32IO())
 

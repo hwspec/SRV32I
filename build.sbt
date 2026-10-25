@@ -10,10 +10,10 @@ lazy val root = (project in file("."))
   .settings(
     name := "SRV32I",
 
-    Compile / unmanagedSourceDirectories ++= Seq(
-      baseDirectory.value / "garageworks" / "src" / "main" / "scala",
-    ),
+    resolvers += "central-snapshots" at "https://central.sonatype.com/repository/maven-snapshots/",
+
     libraryDependencies ++= Seq(
+      "io.github.hwspec" %% "garageworks" % "0.4.0-SNAPSHOT",
       "org.chipsalliance" %% "chisel" % chiselVersion,
       "org.scalatest" %% "scalatest" % "3.2.19" % "test",
     ),

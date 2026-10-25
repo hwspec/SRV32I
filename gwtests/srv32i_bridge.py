@@ -2,7 +2,7 @@
 # License: See LICENSE in the project top-level directory.
 
 import cocotb
-from axi_test_bridge.cocotb_bridge import COCOTB_Bridge
+from garageworks.bridge.cocotb_bridge import COCOTB_Bridge
 
 # ---------------------------------------------------------------------------
 # Status register bit masks (status_r)

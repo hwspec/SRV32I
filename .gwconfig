@@ -1,6 +1,4 @@
-name=AxiSRV32I
-package=srv32i
+chiseltop=srv32i.AxiSRV32I
 testdir=gwtests
 tests=loop_hex
-
 

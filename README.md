@@ -18,25 +18,33 @@ known limitations.
 - GCC (tested with 11.1.0 and 15.2.1)
 - Java (tested with OpenJDK 17.0.7 and 21.0.11)
 - sbt (tested with 1.9.2 and 2.0.8)
-- Python 3 with `venv` and `pip`
+- Python 3 with `pip`
+- [GarageWorks](https://github.com/hwspec/garageworks) (`gwscript`, cocotb/AVED
+  bridges), installed from its PyPI dev release:
+  ```
+  pip install garageworks==0.2.0.dev1792970358
+  ```
+  (see [PyPI](https://pypi.org/project/garageworks/#history) for the latest
+  dev version)
 
 - [optional] Vivado 2025.1 to compile FPGA firmware and program
 - [optional] RV32 cross compiler (tested with riscv32-linux-gnu-gcc 15.2.1) to run non-hex tests such as sum_c, loop_asm
 
-
+The Chisel library (`io.github.hwspec::garageworks`, see [build.sbt](build.sbt))
+is resolved from Sonatype Central's Maven snapshot repository, so no local
+build of GarageWorks is needed on the Scala side either.
 
 ## Build and run tests on Verilator
 
 The command below prepares the environment, builds the designs, and run the default test (gwtests/tb_loop_hex.py).
 ```
-python ./gwscript.py
+gwscript
 ```
 
 To run other tests
 ```
-source garageworks/.venv/bin/activate
 cd gwtests
-make rlwimi
+make -f Makefile.gw rlwimi
 ```
 Note: to run loop_asm, sum_c, an RV32 cross compiler is needed.
 
@@ -56,17 +64,19 @@ export PATH="$INSTDIR/2025.1/gnu/armr5/lin/gcc-arm-none-eabi/bin:$PATH"
 
 Then,
 ```
-python ./gwscript.py --fpga
+gwscript --fpga
 ```
+(use `gwscript --enable-fpga` to make FPGA stages run by default, without
+needing `--fpga` each time)
 
 
 ## gwscript options
 
 ```
-python ./gwscript.py --status        # stage states, incl. computed "stale (reason)"
-python ./gwscript.py --dry-run       # what would run and why; runs nothing
-python ./gwscript.py --resume [STAGE]
-python ./gwscript.py --clean | --clean-all
+gwscript --status        # stage states, incl. computed "stale (reason)"
+gwscript --dry-run       # what would run and why; runs nothing
+gwscript --resume [STAGE]
+gwscript --clean | --clean-all
 ```
 
 - A successful stage becomes **stale** when an upstream stage re-runs or its
@@ -87,7 +97,7 @@ logs are shared with local runs.
 
 ```
 pip install mcp
-claude mcp add gwscript -- python /path/to/SRV32I/gwscript.py -C /path/to/SRV32I --mcp
+claude mcp add gwscript -- gwscript -C /path/to/SRV32I --mcp
 ```
 
 Tools: `status`, `dry_run`, `next_stage`, `results`, `log`, `run`, `job`, `jobs`,
@@ -99,7 +109,7 @@ Non-interactive runs (MCP, tmux) cannot prompt for a password, so `programhw`
 needs passwordless sudo for `ami_tool` and the PCIe rescan:
 
 ```
-python ./gwscript.py --sudoers          # prints the line to add
+gwscript --sudoers          # prints the line to add
 sudo visudo -f /etc/sudoers.d/gwscript
 ```
 
@@ -111,29 +121,34 @@ same cocotb test, run against `AxiSRV32I.scala`'s register map, works
 whether the "AXI slave" underneath is a Verilator/cocotb simulation or
 an actual AXI4-Lite endpoint on the V80. `conv_cocotb_to_fpga` tool
 handles the sim to FPGA rebasing, so `make <test>` and `make hw_<test>`
-in `gwtests/Makefile` drive the exact same `tb_*.py` sources; one
+in `gwtests/Makefile.gw` drive the exact same `tb_*.py` sources; one
 GarageWorks-style test source, two run targets.
 
 ## GarageWorks status
 
-- `gwscript.py`: currently local to this repo; it'll move into GarageWorks
-  once that's released
+- `gwscript` now comes from the `garageworks` PyPI package (see Requirements
+  above); this repo no longer vendors its own copy or a `garageworks` git
+  submodule.
 
 ## Repo layout
 
 ```
-gwscript.py                  # entry point; drives tb_*.py against sim or FPGA
+.gwconfig                    # chiseltop, testdir, tests for gwscript
 src/main/scala/srv32i/
   SRV32I.scala          # core: Decoder, ALU, BranchUnit, RegFile, CustomOp
   AxiSRV32I.scala        # AXI4-Lite wrapper (register map, imem/dmem backing)
 src/test/scala/src32i/
   SRV32ISpec.scala       # Scala-level ChiselSim spec (unit-level, not GarageWorks/cocotb)
 gwtests/
-  tb_loop.py              # loop test
+  tb_loop_hex.py           # loop test (default target, from a hex memory image)
+  tb_loop_asm.py           # loop test, assembled from source (needs RV32 cross compiler)
   tb_rlwimi.py             # custom rlwimi extension test
   tb_rlwimieq.py           # rlwimi-equivalent sequence of plain RV32I instructions
+  tb_sum_c.py              # C program test (needs RV32 cross compiler)
+  tb_embeddedasm.py        # embedded-assembly test (needs RV32 cross compiler)
   srv32i_bridge.py         # SRV32I-specific COCOTB_Bridge subclass
-  Makefile                 # make <test> (sim), make hw_<test> (V80), make list
+  srv32i.mk                # repo-specific settings included by Makefile.gw
+  Makefile.gw              # make <test> (sim), make hw_<test> (V80), make list
 ```
 
 

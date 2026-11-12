@@ -88,6 +88,19 @@ class SRV32I_Bridge(COCOTB_Bridge):
         st = await self.waitForHalt(timeout)
         await self.enable(0)   # disable so dmem/imem are readable again
 
+        if check_halt and (st & ST_ILLEGAL):
+            pc = await self.readPC()
+            cycles = await self.readCycles()
+            regs = [await self.readReg(i) for i in range(32)]
+            faulting = await self.readInst(pc // 4)
+            self.log.error(
+                f"ILLEGAL halt: status={st:#010x} pc={pc:#010x} "
+                f"cycles={cycles} faulting_instr={faulting:#010x}"
+            )
+            self.log.error(
+                "regs: " + " ".join(f"x{i}={v:#010x}" for i, v in enumerate(regs))
+            )
+
         if check_halt:
             assert st & ST_ECALL, f"ecall not set: {st:#010x}"
             assert st & ST_HALTED, f"halted not set: {st:#010x}"

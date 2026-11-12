@@ -54,10 +54,11 @@ The `sum_c` test exposed a hardware-specific failure: the
 processor sometimes halted with an illegal-instruction trap rather
 than completing via `ecall`. This behavior appeared on FPGA
 hardware but not in Verilator/cocotb simulation with identical
-RTL and test code. Unlike the other tests, `sum_c` performs
-a CPU-executed memory store. Once triggered, the failure persisted
-across subsequent runs, suggesting a possible timing or
-memory-aliasing issue. Its cause remains under investigation,
+RTL and test code. Once triggered, the failure persisted
+across subsequent runs. The root cause — an unreset register file that
+let FPGA test runs inherit stale architectural register state from
+whatever test ran before them on the same bitstream — was tracked down by
+reproducing the failure on demand and is described in detail below,
 illustrating the value of FPGA-in-the-loop verification.
 
 ## Table: GWS-reported cocotb (Verilator) and FPGA (AMD Alveo V80) stage times
@@ -79,3 +80,67 @@ use the three successful runs.
 
 † The `longloop` values are single runs (no standard deviation), covering
 approximately 6×10⁶ core clock cycles.
+
+## Root cause of the `sum_c` FPGA-only illegal-instruction failure
+
+The intermittent `sum_c` failure was reproduced on demand by re-running the
+FPGA `testhw` stage repeatedly against an already-programmed bitstream, and
+diagnosed by extending the test bridge to dump the processor's debug PC,
+architectural registers, and cycle count whenever the status register
+reported `ST_ILLEGAL`. A representative failing run read back
+`status=0x6` (`ST_HALTED | ST_ILLEGAL`), `pc=0x0000135a`, and
+`x1=0x00001356` — both values two bytes short of 4-byte alignment, even
+though the core implements no compressed-instruction (RVC) support and
+every legitimate branch/jump target in RV32I code is word-aligned. Since
+`x1` (the return-address register, `ra`) held the same misaligned value the
+core had just faulted on, the failure was a genuine architectural
+corruption of register state during program execution, not an artifact of
+the debug-readback path.
+
+The register file (`RegFile` in `SRV32I.scala`) backed its 32 architectural
+registers with a plain Chisel `Mem(32, UInt(32.W))`. In Chisel, `Mem`
+contents are never touched by reset — only `Reg`/`RegInit` respond to
+`reset`/`withReset`, a distinction Chisel preserves even though the entire
+core is instantiated via `withReset(combinedReset)` in the enclosing GWCD.
+Issuing a soft reset therefore cleared the processor's control/status state
+but silently left all 32 general-purpose registers holding whatever values
+they last held.
+
+This gap is invisible in Verilator/cocotb simulation because each cocotb
+test elaborates a brand-new DUT instance, so every register starts at its
+Chisel-specified zero value regardless of the reset bug. On the FPGA,
+however, a single programmed bitstream persists across many sequential
+`gws` test invocations within one session: softReset runs before each test,
+but the register file is never actually cleared, so `sum_c` can inherit
+leftover register contents from whichever test happened to run immediately
+before it. This explains all three observed symptoms at once: the failure
+is FPGA-only (simulation always starts clean), intermittent (it depends on
+test execution order/history, not on `sum_c` alone), and persistent once
+triggered within a run (nothing in the normal control flow ever clears the
+stale value).
+
+The fix replaces the unreset `Mem` with an explicitly resettable register
+array:
+
+```scala
+// before
+val regs = Mem(32, UInt(32.W))
+
+// after
+val regs = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
+```
+
+`RegInit`-backed storage is a true Chisel `Reg`, so it responds correctly
+to `combinedReset`/`softReset`, guaranteeing all 32 general-purpose
+registers are zeroed on every soft reset regardless of what ran
+previously on the same bitstream. Read/write port behavior and priority
+between the two existing write ports (`wen` and `wenLoad`) are preserved
+unchanged; only the reset semantics of the underlying storage changed.
+
+Hardware re-validation confirmed the fix. After regenerating the RTL,
+rebuilding the FPGA bitstream (Vivado 2025.1, ~50 minutes), and
+reprogramming the Alveo V80 with the new bitstream, `sum_c` was re-run
+five consecutive times against the same programmed bitstream. All five
+runs passed (P,P,P,P,P; FPGA stage time 0.32 ± 0.04 s), compared with the
+original P,P,P,F,F pattern, confirming the illegal-instruction failure no
+longer reproduces.

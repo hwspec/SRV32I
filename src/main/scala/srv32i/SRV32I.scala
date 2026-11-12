@@ -244,21 +244,27 @@ class RegFile extends Module {
     val debugRegs = Output(Vec(32, UInt(32.W)))
   })
 
-  val regs = Mem(32, UInt(32.W))
+  // A plain Mem is never touched by implicit reset (only Reg/RegInit are),
+  // so GPR content would otherwise survive a softReset and -- on real FPGA
+  // hardware, where the bitstream stays resident across many test runs --
+  // leak stale values from whatever program last ran on the same DUT
+  // instance. Verilator never shows this since each test elaborates a fresh
+  // DUT. Use RegInit-backed storage so combinedReset actually clears it.
+  val regs = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
 
-  io.rs1Data := Mux(io.rs1Addr === 0.U, 0.U, regs.read(io.rs1Addr))
-  io.rs2Data := Mux(io.rs2Addr === 0.U, 0.U, regs.read(io.rs2Addr))
-  io.rdData  := Mux(io.rdAddr === 0.U, 0.U, regs.read(io.rdAddr))
+  io.rs1Data := Mux(io.rs1Addr === 0.U, 0.U, regs(io.rs1Addr))
+  io.rs2Data := Mux(io.rs2Addr === 0.U, 0.U, regs(io.rs2Addr))
+  io.rdData  := Mux(io.rdAddr === 0.U, 0.U, regs(io.rdAddr))
 
   when(io.wenLoad && io.waddrLoad =/= 0.U) {
-    regs.write(io.waddrLoad, io.wdataLoad)
+    regs(io.waddrLoad) := io.wdataLoad
   }
   when(io.wen && io.waddr =/= 0.U) {
-    regs.write(io.waddr, io.wdata)
+    regs(io.waddr) := io.wdata
   }
 
   for (i <- 0 until 32) {
-    io.debugRegs(i) := (if (i == 0) 0.U else regs.read(i.U))
+    io.debugRegs(i) := (if (i == 0) 0.U else regs(i))
   }
 }
 

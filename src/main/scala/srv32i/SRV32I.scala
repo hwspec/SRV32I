@@ -165,19 +165,34 @@ class Decoder extends Module {
 }
 
 object MemAccess {
-  def storeMask(funct3: UInt): UInt = MuxLookup(funct3, "b1111".U)(Seq(
-    "b000".U -> "b0001".U, // SB
-    "b001".U -> "b0011".U, // SH
-    "b010".U -> "b1111".U  // SW
-  ))
+  // addrLow is the byte offset within the addressed word (addr(1,0)). SB/SH
+  // target one of the dmem's four byte lanes depending on this offset, so
+  // the lane mask and the write data must be shifted up into that lane; LW
+  // (and the SW path) always address a full, naturally-aligned word, where
+  // addrLow is 0 and the shift is a no-op.
+  def storeMask(funct3: UInt, addrLow: UInt): UInt = {
+    val baseMask = MuxLookup(funct3, "b1111".U)(Seq(
+      "b000".U -> "b0001".U, // SB
+      "b001".U -> "b0011".U, // SH
+      "b010".U -> "b1111".U  // SW
+    ))
+    (baseMask << addrLow)(3, 0)
+  }
 
-  def loadData(funct3: UInt, rdata: UInt): UInt = MuxLookup(funct3, rdata)(Seq(
-    "b000".U -> Cat(Fill(24, rdata(7)), rdata(7, 0)),    // LB
-    "b001".U -> Cat(Fill(16, rdata(15)), rdata(15, 0)),  // LH
-    "b010".U -> rdata,                                    // LW
-    "b100".U -> Cat(0.U(24.W), rdata(7, 0)),              // LBU
-    "b101".U -> Cat(0.U(16.W), rdata(15, 0))              // LHU
-  ))
+  def storeData(wdata: UInt, addrLow: UInt): UInt = wdata << (addrLow << 3)
+
+  // rdata is first shifted down so the addressed byte lane lands at bits
+  // 7:0 (or 15:0 for a halfword), then sign/zero-extended as before.
+  def loadData(funct3: UInt, rdata: UInt, addrLow: UInt): UInt = {
+    val aligned = rdata >> (addrLow << 3)
+    MuxLookup(funct3, aligned)(Seq(
+      "b000".U -> Cat(Fill(24, aligned(7)), aligned(7, 0)),    // LB
+      "b001".U -> Cat(Fill(16, aligned(15)), aligned(15, 0)),  // LH
+      "b010".U -> rdata,                                        // LW
+      "b100".U -> Cat(0.U(24.W), aligned(7, 0)),                // LBU
+      "b101".U -> Cat(0.U(16.W), aligned(15, 0))                // LHU
+    ))
+  }
 }
 
 // RLWIMI: the sole custom-0 op, encoded in immediate form (see
@@ -338,9 +353,10 @@ class SRV32I extends Module {
 
   // Outstanding load: set when a load completes EX; consumed one cycle later
   // to (a) write its result and (b) let the hazard check see it.
-  val loadPendReg     = RegInit(false.B)
-  val loadPendRdReg   = Reg(UInt(5.W))
-  val loadPendF3Reg   = Reg(UInt(3.W))
+  val loadPendReg      = RegInit(false.B)
+  val loadPendRdReg    = Reg(UInt(5.W))
+  val loadPendF3Reg    = Reg(UInt(3.W))
+  val loadPendAddrLReg = Reg(UInt(2.W)) // addr(1,0) of the completing load, for byte-lane selection
 
   val active = io.enable && !haltedReg
   io.running := active
@@ -409,9 +425,9 @@ class SRV32I extends Module {
   // ---------------- Data memory ----------------
   val memAddr = rs1Data +% Mux(dec.isStore, dec.immS, dec.immI)
   io.dmem.addr  := memAddr
-  io.dmem.wdata := rs2Data
+  io.dmem.wdata := MemAccess.storeData(rs2Data, memAddr(1, 0))
   io.dmem.wen   := instrValid && dec.isStore
-  io.dmem.wmask := MemAccess.storeMask(dec.funct3)
+  io.dmem.wmask := MemAccess.storeMask(dec.funct3, memAddr(1, 0))
 
   // ---------------- Next PC / writeback values ----------------
   val pcPlus4      = pcExReg +% 4.U(32.W)
@@ -443,7 +459,7 @@ class SRV32I extends Module {
 
   regFile.io.wenLoad   := loadPendReg
   regFile.io.waddrLoad := loadPendRdReg
-  regFile.io.wdataLoad := MemAccess.loadData(loadPendF3Reg, io.dmem.rdata)
+  regFile.io.wdataLoad := MemAccess.loadData(loadPendF3Reg, io.dmem.rdata, loadPendAddrLReg)
 
   // ---------------- Pipeline advance ----------------
   when(io.enable) {
@@ -459,11 +475,20 @@ class SRV32I extends Module {
       pcFetchReg := Mux(stall, pcExReg,
         Mux(flushRedirect, redirectTarget, pcFetchReg +% 4.U))
       pcExReg   := pcFetchReg
-      bubbleReg := flushRedirect // next cycle's instruction is a bubble iff this cycle flushed
+      // The cycle after this one must be a bubble whenever this cycle either
+      // (a) flushes to a branch/jump target -- squashing the instruction
+      // already speculatively fetched under the not-taken/PC+4 prediction --
+      // or (b) stalls -- squashing the instruction already speculatively
+      // fetched right behind the stalling one. That fetch already landed in
+      // imem by the time the stall is detected, so it cannot be cancelled;
+      // it can only be marked invalid once it shows up next cycle, exactly
+      // like the branch-flush case.
+      bubbleReg := flushRedirect || stall
 
-      loadPendReg   := instrValid && dec.isLoad
-      loadPendRdReg := dec.rd
-      loadPendF3Reg := dec.funct3
+      loadPendReg      := instrValid && dec.isLoad
+      loadPendRdReg    := dec.rd
+      loadPendF3Reg    := dec.funct3
+      loadPendAddrLReg := memAddr(1, 0)
 
       when(instrValid) {
         when(dec.illegal)      { illegalReg := true.B; haltedReg := true.B }

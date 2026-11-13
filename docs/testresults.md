@@ -59,7 +59,7 @@ data point for the cocotb-versus-FPGA speedup comparison. Each
 repetition recomputes the sieve from scratch and writes the final
 count of primes below 700 (125) to a fixed data-memory location,
 which the testbench checks independently of the cycle count. A
-single run executes 4,442,125 core cycles.
+single run executes 4,654,172 core cycles.
 
 The `sum_c` test exposed a hardware-specific failure: the
 processor sometimes halted with an illegal-instruction trap rather
@@ -85,19 +85,13 @@ per target and backend, except as noted.
 | rlwimi | Custom SRV32I instruction implementing rlwimi | 14.70 ± 0.51 | 0.20 ± 0.00 |
 | sum_c | Summation program written in C | 16.46 ± 0.29 | 0.23 ± 0.06* |
 | longloop | 2,000,000-iteration loop in RISC-V assembly | 1093.5† | 0.7† |
-| sieve_c | Sieve of Eratosthenes (N=700) × 50 reps in C | 320.74 ± 4.69 | pending‡ |
+| sieve_c | Sieve of Eratosthenes (N=700) × 50 reps in C | 347.52 ± 17.47 | 0.42 ± 0.38 |
 
 \* For `sum_c` on FPGA, only three of five runs passed (P,P,P,F,F); statistics
 use the three successful runs.
 
 † The `longloop` values are single runs (no standard deviation), covering
 approximately 6×10⁶ core clock cycles.
-
-‡ The `sieve_c` FPGA stage time is pending: the test target was developed
-and verified against the local `gws-local` project checkout, but the
-`gws-alveo` FPGA project checkout on the remote host lagged behind by a
-few commits and did not yet have the new test files, so `testhw --fpga
-sieve_c` could not be run at the time of writing.
 
 ## Root cause of the `sum_c` FPGA-only illegal-instruction failure
 
@@ -163,7 +157,90 @@ runs passed (P,P,P,P,P; FPGA stage time 0.32 ± 0.04 s), compared with the
 original P,P,P,F,F pattern, confirming the illegal-instruction failure no
 longer reproduces.
 
-## A load-use stall bug found while developing `sieve_c`
+## Two RTL bugs found while developing `sieve_c`
+
+Developing `sieve_c` — the first test program to exercise sub-word
+loads/stores (`sieve.c`'s packed bitmask) together with tight,
+register-reusing ALU chains right after a load — surfaced two
+distinct, previously-latent RTL bugs. Both were root-caused by static
+inspection of the RTL and confirmed with an independent, from-scratch,
+non-pipelined RV32I instruction-set simulator written purely as a
+ground-truth oracle, decoupled from any RTL bug: hand-assembled repro
+sequences were run through both the simulator and real `cocotb`
+hardware and the two sources of truth compared directly. Both bugs
+were fixed directly in the RTL (not worked around in software) and
+re-verified end-to-end: full local `cocotb` regression, then FPGA
+rebuild (Vivado 2025.1, ~50 minutes), reprogramming, and FPGA
+re-validation, all passing.
+
+### Bug 1: byte-lane addressing ignored for SB/LB/LBU/SH/LH/LHU
+
+`sieve.c` packs 700 primality flags into a 32-bit-word bitmask, so
+every access is a full-word `lw`/`sw` and this bug does not actually
+manifest in the `sieve_c` benchmark itself — it was found by
+inspection while investigating the pipeline bug below, since both
+trace through the same data-memory access path. `MemAccess` computed
+the store byte-enable mask and sign/zero-extended load data purely
+from `funct3`, never consulting the address's low two bits:
+
+```scala
+// before
+def storeMask(funct3: UInt): UInt = MuxLookup(funct3, "b1111".U)(Seq(
+  "b000".U -> "b0001".U, // SB
+  "b001".U -> "b0011".U, // SH
+  "b010".U -> "b1111".U  // SW
+))
+
+def loadData(funct3: UInt, rdata: UInt): UInt = MuxLookup(funct3, rdata)(Seq(
+  "b000".U -> Cat(Fill(24, rdata(7)), rdata(7, 0)),    // LB
+  "b001".U -> Cat(Fill(16, rdata(15)), rdata(15, 0)),  // LH
+  "b010".U -> rdata,                                    // LW
+  "b100".U -> Cat(0.U(24.W), rdata(7, 0)),              // LBU
+  "b101".U -> Cat(0.U(16.W), rdata(15, 0))              // LHU
+))
+```
+
+Every `SB`/`SH` therefore always wrote byte lane 0 of its target word
+regardless of the actual address, and every `LB`/`LBU`/`LH`/`LHU`
+always read byte lane 0 back, silently corrupting any sub-word access
+at a non-zero byte offset. The fix threads the address's low two bits
+(`addrLow`, i.e. `memAddr(1,0)`) through `storeMask`, a new
+`storeData`, and `loadData`, shifting the byte-enable mask, the write
+data, and the read data into/out of the correct lane:
+
+```scala
+// after
+def storeMask(funct3: UInt, addrLow: UInt): UInt = {
+  val baseMask = MuxLookup(funct3, "b1111".U)(Seq(
+    "b000".U -> "b0001".U, // SB
+    "b001".U -> "b0011".U, // SH
+    "b010".U -> "b1111".U  // SW
+  ))
+  (baseMask << addrLow)(3, 0)
+}
+
+def storeData(wdata: UInt, addrLow: UInt): UInt = wdata << (addrLow << 3)
+
+def loadData(funct3: UInt, rdata: UInt, addrLow: UInt): UInt = {
+  val aligned = rdata >> (addrLow << 3)
+  MuxLookup(funct3, aligned)(Seq(
+    "b000".U -> Cat(Fill(24, aligned(7)), aligned(7, 0)),    // LB
+    "b001".U -> Cat(Fill(16, aligned(15)), aligned(15, 0)),  // LH
+    "b010".U -> rdata,                                        // LW
+    "b100".U -> Cat(0.U(24.W), aligned(7, 0)),                // LBU
+    "b101".U -> Cat(0.U(16.W), aligned(15, 0))                // LHU
+  ))
+}
+```
+
+`io.dmem.wdata`/`io.dmem.wmask` are driven from `storeData`/`storeMask`
+with `memAddr(1,0)`, and the load-side write port
+(`regFile.io.wdataLoad`) is driven from `loadData` using a new pipeline
+register, `loadPendAddrLReg`, that captures `memAddr(1,0)` for the
+completing load so the correct lane is selected a cycle later in
+writeback (see `loadPendAddrLReg` below).
+
+### Bug 2: load-use stall didn't squash the following instruction
 
 Early `sieve_c` runs produced silently wrong numeric results — not a
 crash or an illegal-instruction trap, but plausible-looking garbage
@@ -183,7 +260,7 @@ instruction reading the register a `lw` is about to write) is
 detected explicitly:
 
 ```scala
-// SRV32I.scala:355-366
+// SRV32I.scala:378-382
 val stall = !bubbleReg && loadPendReg && loadPendRdReg =/= 0.U &&
   (dec.rs1 === loadPendRdReg || dec.rs2 === loadPendRdReg ||
     ((writesRd || dec.isLoad) && dec.rd === loadPendRdReg))
@@ -193,57 +270,64 @@ val instrValid = !bubbleReg && !stall
 
 Setting `instrValid := false` correctly keeps the hazardous
 instruction from executing with a stale operand for one cycle, and a
-second register-file write port (`wenLoad`/`waddrLoad`/`wdataLoad`,
-`SRV32I.scala:444-446`) lets it pick up the freshly-loaded value when
-it is re-issued. The bug is in the PC bookkeeping that is supposed to
-make that re-issue happen:
+second register-file write port (`wenLoad`/`waddrLoad`/`wdataLoad`)
+lets it pick up the freshly-loaded value when it is re-issued. The bug
+was in the PC bookkeeping that is supposed to make that re-issue
+happen:
 
 ```scala
-// SRV32I.scala:448-462 ("Pipeline advance")
+// before (SRV32I.scala, "Pipeline advance")
 pcFetchReg := Mux(stall, pcExReg,
   Mux(flushRedirect, redirectTarget, pcFetchReg +% 4.U))
 pcExReg   := pcFetchReg
-bubbleReg := flushRedirect
+bubbleReg := flushRedirect // next cycle's instruction is a bubble iff this cycle flushed
 ```
 
-`pcFetchReg` is correctly held at the stalling instruction's own
-address during a stall, so imem keeps re-fetching the same word.
-However, `pcExReg := pcFetchReg` is unconditional — on a stall cycle
-it still advances to whatever was already one cycle ahead in the
+`pcFetchReg` was correctly held at the stalling instruction's own
+address during a stall, so imem kept re-fetching the same word.
+However, `pcExReg := pcFetchReg` was unconditional — on a stall cycle
+it still advanced to whatever was already one cycle ahead in the
 fetch stage, i.e. the instruction *after* the stalling one. And
 `bubbleReg`, the mechanism that correctly squashes an already-fetched,
-now-stale instruction after a taken branch (`bubbleReg :=
-flushRedirect`), has no equivalent term for `stall`. The net effect:
-the instruction immediately following a stalling load-consumer is
-phantom-executed one cycle early with pre-hazard operands, and
-because `pcExReg`/`pcFetchReg` never actually walk back, that same
-instruction is then fetched and executed a second time once the
-stalled instruction's correct, delayed replay has gone through. This
-single defect explains every previously observed symptom: an extra
-`addi` application, an extra `slli` doubling, and the original
+now-stale instruction after a taken branch, had no equivalent term for
+`stall`. The net effect: the instruction immediately following a
+stalling load-consumer was phantom-executed one cycle early with
+pre-hazard operands, and because `pcExReg`/`pcFetchReg` never actually
+walked back, that same instruction was then fetched and executed a
+second time once the stalled instruction's correct, delayed replay had
+gone through. This single defect explained every observed symptom: an
+extra `addi` application, an extra `slli` doubling, and the original
 `lw`/`sw` failures (where the phantom-executed instruction immediately
 after the store was often `ecall`, which latched `haltedReg` early and
 silently dropped the real store that should have executed one cycle
 later).
 
-This was root-caused by static inspection of the pipeline-advance
-logic above (no RTL changes), and confirmed with an independent,
-from-scratch, non-pipelined RV32I instruction-set simulator written
-purely as a ground-truth oracle, decoupled from any RTL bug. Running
-hand-assembled repro sequences (chained `addi`/`slli` after a `lw`)
-through both the simulator and real `cocotb` hardware let the two
-sources of truth be compared directly, confirming the processor's
-output diverged from the ISA spec exactly on these sequences.
+The fix adds `stall` as a second bubble-inducing condition, so the
+instruction speculatively fetched behind a stalling load-consumer is
+squashed exactly like a branch-flushed one, and adds
+`loadPendAddrLReg` (used by the byte-lane fix above) to the same
+load-pending bookkeeping that already tracked the load's destination
+register and `funct3`:
 
-Per the project's standing practice of not modifying the RTL from
-this session, the fix applied was a compiler-output-level workaround
-rather than an RTL patch: every compiled program has a NOP (`addi
-x0, x0, 0`) inserted immediately after each `lw`, which makes the
-hazard condition unreachable for the following instruction (a NOP
-reads and writes no register, so it can never match
-`loadPendRdReg`), with all branch and jump immediates in the binary
-re-encoded to still land on their original logical targets. This
-transform (`insert_nops_after_loads` in `gwtests/hazard_fix.py`) is
-applied to every compiled program used for the `sieve_c` benchmark
-above, and was itself verified against the independent simulator
-before being trusted for hardware timing runs.
+```scala
+// after (SRV32I.scala, "Pipeline advance")
+pcFetchReg := Mux(stall, pcExReg,
+  Mux(flushRedirect, redirectTarget, pcFetchReg +% 4.U))
+pcExReg   := pcFetchReg
+bubbleReg := flushRedirect || stall
+
+loadPendReg      := instrValid && dec.isLoad
+loadPendRdReg    := dec.rd
+loadPendF3Reg    := dec.funct3
+loadPendAddrLReg := memAddr(1, 0)
+```
+
+Both fixes landed together in a single RTL change (commit `8a7055e`,
+"Fix byte-lane addressing and load-use stall squash bugs in SRV32I"),
+and were validated by: the full local `cocotb` regression
+(`loop_hex`, `loop_asm`, `rlwimieq`, `rlwimi`, `sum_c`, `sieve_c`, all
+passing); a fresh FPGA bitstream build, programming, and five
+consecutive FPGA `sieve_c` runs (all passing, matching the local
+`cocotb` cycle count of 4,654,172 exactly); and five consecutive FPGA
+`sum_c` runs (all passing), confirming the earlier register-file reset
+fix was unaffected.

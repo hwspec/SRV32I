@@ -8,7 +8,7 @@ TOPNAME=wrapper
 SRCDIR = $(abspath ../generated/$(HWMODULENAME))
 
 TARGETS =loop_hex rlwimieq rlwimi    # does not require riscv toolchain
-TARGETS+=loop_asm sum_c embeddedasm  # requires riscv toolchain
+TARGETS+=loop_asm sum_c embeddedasm sieve_c  # requires riscv toolchain
 
 .DEFAULT_GOAL := loop_hex
 

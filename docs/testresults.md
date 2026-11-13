@@ -50,6 +50,17 @@ cocotb testbench overhead rather than representing standalone
 Verilator performance; FPGA times also include host-side
 orchestration and communication rather than core execution alone.
 
+The `sieve_c` test is a Sieve of Eratosthenes (N=700, primality
+flags packed into a 32-bit-word bitmask in data memory and built
+at runtime) wrapped in an outer repeat loop (50 repetitions) to
+inflate the total instruction count into the same multi-million-cycle
+range as `longloop`, giving a second, algorithmically distinct
+data point for the cocotb-versus-FPGA speedup comparison. Each
+repetition recomputes the sieve from scratch and writes the final
+count of primes below 700 (125) to a fixed data-memory location,
+which the testbench checks independently of the cycle count. A
+single run executes 4,442,125 core cycles.
+
 The `sum_c` test exposed a hardware-specific failure: the
 processor sometimes halted with an illegal-instruction trap rather
 than completing via `ecall`. This behavior appeared on FPGA
@@ -74,12 +85,19 @@ per target and backend, except as noted.
 | rlwimi | Custom SRV32I instruction implementing rlwimi | 14.70 ± 0.51 | 0.20 ± 0.00 |
 | sum_c | Summation program written in C | 16.46 ± 0.29 | 0.23 ± 0.06* |
 | longloop | 2,000,000-iteration loop in RISC-V assembly | 1093.5† | 0.7† |
+| sieve_c | Sieve of Eratosthenes (N=700) × 50 reps in C | 320.74 ± 4.69 | pending‡ |
 
 \* For `sum_c` on FPGA, only three of five runs passed (P,P,P,F,F); statistics
 use the three successful runs.
 
 † The `longloop` values are single runs (no standard deviation), covering
 approximately 6×10⁶ core clock cycles.
+
+‡ The `sieve_c` FPGA stage time is pending: the test target was developed
+and verified against the local `gws-local` project checkout, but the
+`gws-alveo` FPGA project checkout on the remote host lagged behind by a
+few commits and did not yet have the new test files, so `testhw --fpga
+sieve_c` could not be run at the time of writing.
 
 ## Root cause of the `sum_c` FPGA-only illegal-instruction failure
 
@@ -144,3 +162,88 @@ five consecutive times against the same programmed bitstream. All five
 runs passed (P,P,P,P,P; FPGA stage time 0.32 ± 0.04 s), compared with the
 original P,P,P,F,F pattern, confirming the illegal-instruction failure no
 longer reproduces.
+
+## A load-use stall bug found while developing `sieve_c`
+
+Early `sieve_c` runs produced silently wrong numeric results — not a
+crash or an illegal-instruction trap, but plausible-looking garbage
+(for example, an expected count of 4 came back as 168 for a small
+test case). The symptom only appeared for specific instruction
+sequences (two chained ALU instructions that both touched the same
+register right after a `lw`, or a `lw` immediately followed by a
+`sw`/other instruction), which pointed at the processor's load-use
+hazard handling rather than at the test programs themselves.
+
+SRV32I's execution pipeline has only two stages, IF and EX, with no
+explicit IF/EX latch: imem's own one-cycle synchronous-read output
+*is* the pipeline register (`pcFetchReg`/`pcExReg` in
+`SRV32I.scala`). A load's result is not available until the cycle
+after it leaves EX, so a true load-use hazard (the very next
+instruction reading the register a `lw` is about to write) is
+detected explicitly:
+
+```scala
+// SRV32I.scala:355-366
+val stall = !bubbleReg && loadPendReg && loadPendRdReg =/= 0.U &&
+  (dec.rs1 === loadPendRdReg || dec.rs2 === loadPendRdReg ||
+    ((writesRd || dec.isLoad) && dec.rd === loadPendRdReg))
+
+val instrValid = !bubbleReg && !stall
+```
+
+Setting `instrValid := false` correctly keeps the hazardous
+instruction from executing with a stale operand for one cycle, and a
+second register-file write port (`wenLoad`/`waddrLoad`/`wdataLoad`,
+`SRV32I.scala:444-446`) lets it pick up the freshly-loaded value when
+it is re-issued. The bug is in the PC bookkeeping that is supposed to
+make that re-issue happen:
+
+```scala
+// SRV32I.scala:448-462 ("Pipeline advance")
+pcFetchReg := Mux(stall, pcExReg,
+  Mux(flushRedirect, redirectTarget, pcFetchReg +% 4.U))
+pcExReg   := pcFetchReg
+bubbleReg := flushRedirect
+```
+
+`pcFetchReg` is correctly held at the stalling instruction's own
+address during a stall, so imem keeps re-fetching the same word.
+However, `pcExReg := pcFetchReg` is unconditional — on a stall cycle
+it still advances to whatever was already one cycle ahead in the
+fetch stage, i.e. the instruction *after* the stalling one. And
+`bubbleReg`, the mechanism that correctly squashes an already-fetched,
+now-stale instruction after a taken branch (`bubbleReg :=
+flushRedirect`), has no equivalent term for `stall`. The net effect:
+the instruction immediately following a stalling load-consumer is
+phantom-executed one cycle early with pre-hazard operands, and
+because `pcExReg`/`pcFetchReg` never actually walk back, that same
+instruction is then fetched and executed a second time once the
+stalled instruction's correct, delayed replay has gone through. This
+single defect explains every previously observed symptom: an extra
+`addi` application, an extra `slli` doubling, and the original
+`lw`/`sw` failures (where the phantom-executed instruction immediately
+after the store was often `ecall`, which latched `haltedReg` early and
+silently dropped the real store that should have executed one cycle
+later).
+
+This was root-caused by static inspection of the pipeline-advance
+logic above (no RTL changes), and confirmed with an independent,
+from-scratch, non-pipelined RV32I instruction-set simulator written
+purely as a ground-truth oracle, decoupled from any RTL bug. Running
+hand-assembled repro sequences (chained `addi`/`slli` after a `lw`)
+through both the simulator and real `cocotb` hardware let the two
+sources of truth be compared directly, confirming the processor's
+output diverged from the ISA spec exactly on these sequences.
+
+Per the project's standing practice of not modifying the RTL from
+this session, the fix applied was a compiler-output-level workaround
+rather than an RTL patch: every compiled program has a NOP (`addi
+x0, x0, 0`) inserted immediately after each `lw`, which makes the
+hazard condition unreachable for the following instruction (a NOP
+reads and writes no register, so it can never match
+`loadPendRdReg`), with all branch and jump immediates in the binary
+re-encoded to still land on their original logical targets. This
+transform (`insert_nops_after_loads` in `gwtests/hazard_fix.py`) is
+applied to every compiled program used for the `sieve_c` benchmark
+above, and was itself verified against the independent simulator
+before being trusted for hardware timing runs.
